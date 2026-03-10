@@ -109,7 +109,8 @@ func (b *Builder) Config() *models.BaseConfig {
 
 // LoadWeights loads weights into the GoMLX context.
 func (b *Builder) LoadWeights(ctx *context.Context, weights models.WeightSource) error {
-	return models.LoadWeightsFromMapping(weights, b.WeightMapping(), ctx)
+	_, err := models.LoadWeightsFromMapping(weights, b.WeightMapping(), ctx)
+	return err
 }
 
 // WeightMapping returns the mapping from safetensors keys to context scope paths.

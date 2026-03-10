@@ -19,11 +19,13 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/gomlx/gomlx/backends"
 	. "github.com/gomlx/gomlx/pkg/core/graph"
 	"github.com/gomlx/gomlx/pkg/core/dtypes"
 	"github.com/gomlx/gomlx/pkg/core/shapes"
 	"github.com/gomlx/gomlx/pkg/ml/context"
 	"github.com/gomlx/gomlx/pkg/ml/layers/activations"
+	"github.com/gomlx/gomlx/pkg/ml/nn"
 
 	models "github.com/ajroetker/huggingface-gomlx"
 	"github.com/ajroetker/huggingface-gomlx/architectures/common"
@@ -43,7 +45,8 @@ type Config struct {
 	SlidingWindow int `json:"sliding_window"` // Window size for local attention layers
 
 	// RoPE.
-	RopeTheta float64 `json:"rope_theta"`
+	RopeTheta      float64 `json:"rope_theta"`       // Base frequency for global attention layers (default 1e6)
+	RopeLocalTheta float64 `json:"rope_local_theta"`  // Base frequency for local (SWA) attention layers (default 1e4)
 
 	// Normalization.
 	RMSNormEps float64 `json:"rms_norm_eps"`
@@ -69,10 +72,19 @@ func (c *Config) IsLocalAttentionLayer(layerIdx int) bool {
 	return layerIdx%6 != 5
 }
 
+// RopeTheta returns the RoPE base frequency for the given layer index.
+func (c *Config) RopeFreqBase(layerIdx int) float64 {
+	if c.IsLocalAttentionLayer(layerIdx) {
+		return c.RopeLocalTheta
+	}
+	return c.RopeTheta
+}
+
 // Builder implements the Gemma 3 architecture.
 type Builder struct {
-	config *Config
-	isGGUF bool
+	config    *Config
+	isGGUF    bool
+	quantInfo models.QuantInfo // scope path → GGML quant type for quantized weights
 }
 
 // Name returns the architecture name.
@@ -107,6 +119,13 @@ func (b *Builder) ParseConfig(base *models.BaseConfig) error {
 		b.config.RopeTheta = 1e6
 	}
 
+	if v, ok := base.GetFloat("rope_local_base_freq"); ok {
+		b.config.RopeLocalTheta = v
+	} else {
+		// Gemma 3 uses 10K for local (sliding window) attention layers.
+		b.config.RopeLocalTheta = 1e4
+	}
+
 	if v, ok := base.GetFloat("rms_norm_eps"); ok {
 		b.config.RMSNormEps = v
 	} else {
@@ -123,6 +142,7 @@ func (b *Builder) Config() *models.BaseConfig {
 
 // LoadWeights loads weights into the GoMLX context.
 // Selects the appropriate weight mapping based on the weight source type.
+// For GGUF sources, tracks which weights are quantized for use with QuantizedDense.
 func (b *Builder) LoadWeights(ctx *context.Context, weights models.WeightSource) error {
 	var mapping map[string]string
 	if _, ok := weights.(*models.GGUFSource); ok {
@@ -131,7 +151,22 @@ func (b *Builder) LoadWeights(ctx *context.Context, weights models.WeightSource)
 	} else {
 		mapping = b.hfWeightMapping()
 	}
-	return models.LoadWeightsFromMapping(weights, mapping, ctx)
+	quantInfo, err := models.LoadWeightsFromMapping(weights, mapping, ctx)
+	if err != nil {
+		return err
+	}
+	b.quantInfo = quantInfo
+	return nil
+}
+
+// denseOrQuantized applies a weight-only dense layer, using QuantizedDense for
+// GGML-quantized weights or regular DenseWeightOnly for float weights.
+func (b *Builder) denseOrQuantized(ctx *context.Context, x *Node) *Node {
+	scopePath := strings.TrimPrefix(ctx.Scope(), "/") + "/weights"
+	if qt, ok := b.quantInfo[scopePath]; ok {
+		return common.QuantizedDenseWeightOnly(ctx, x, qt)
+	}
+	return common.DenseWeightOnly(ctx, x)
 }
 
 // WeightMapping returns the GGUF weight mapping (primary target).
@@ -241,16 +276,23 @@ func (b *Builder) hfWeightMapping() map[string]string {
 }
 
 // BuildEmbeddings builds the embedding layer with Gemma 3 scaling.
+// For quantized GGUF models, uses QuantizedEmbedding to dequantize only selected rows.
 func (b *Builder) BuildEmbeddings(ctx *context.Context, inputIDs *Node) *Node {
 	embCtx := ctx.In("embeddings")
 	cfg := b.config
 
-	// Use the actual variable shape if it already exists (e.g. GGUF vocab may differ from metadata).
-	vocabSize := cfg.VocabSize
-	if v := embCtx.GetVariableByScopeAndName(embCtx.Scope(), "embeddings"); v != nil {
-		vocabSize = v.Shape().Dimensions[0]
+	var embeddings *Node
+	if qt, ok := b.quantInfo["embeddings/embeddings"]; ok {
+		// Quantized path: dequantize only the selected rows on-the-fly.
+		embeddings = common.QuantizedEmbedding(embCtx, inputIDs, qt)
+	} else {
+		// Float path.
+		vocabSize := cfg.VocabSize
+		if v := embCtx.GetVariableByScopeAndName(embCtx.Scope(), "embeddings"); v != nil {
+			vocabSize = v.Shape().Dimensions[0]
+		}
+		embeddings = common.Embedding(embCtx, inputIDs, vocabSize, cfg.HiddenSize)
 	}
-	embeddings := common.Embedding(embCtx, inputIDs, vocabSize, cfg.HiddenSize)
 
 	// Gemma 3 scales embeddings by sqrt(hidden_size).
 	scale := ConstAs(embeddings, math.Sqrt(float64(cfg.HiddenSize)))
@@ -271,12 +313,12 @@ func (b *Builder) BuildMLP(ctx *context.Context, hidden *Node) *Node {
 	mlpCtx := ctx.In("mlp")
 
 	// Gated GeLU: gate_proj(x) * GeLU(up_proj(x)), then down_proj.
-	gate := common.DenseWeightOnly(mlpCtx.In("gate"), hidden)
-	up := common.DenseWeightOnly(mlpCtx.In("up"), hidden)
+	gate := b.denseOrQuantized(mlpCtx.In("gate"), hidden)
+	up := b.denseOrQuantized(mlpCtx.In("up"), hidden)
 
 	activated := Mul(activations.GeluApproximate(gate), up)
 
-	return common.DenseWeightOnly(mlpCtx.In("down"), activated)
+	return b.denseOrQuantized(mlpCtx.In("down"), activated)
 }
 
 // BuildDecoderLayer builds a single decoder layer with 4 norms.
@@ -315,7 +357,7 @@ func (b *Builder) Forward(ctx *context.Context, inputIDs, positionIDs *Node) *No
 	hidden = b.BuildDecoder(ctx, hidden, positionIDs)
 
 	// LM head (or tied embeddings).
-	return b.applyLMHead(ctx, hidden, g)
+	return b.ApplyLMHead(ctx, hidden, g)
 }
 
 // CreateExecGraphFn returns a function suitable for context.NewExec.
@@ -383,7 +425,7 @@ func (b *Builder) ForwardPrefill(ctx *context.Context, inputIDs, seqLenNode *Nod
 	hidden = common.RMSNorm(ctx.In("norm"), hidden, cfg.RMSNormEps)
 
 	// LM head.
-	logits := b.applyLMHead(ctx, hidden, g)
+	logits := b.ApplyLMHead(ctx, hidden, g)
 
 	// Extract last position logits.
 	vocabSize := logits.Shape().Dimensions[2]
@@ -441,7 +483,7 @@ func (b *Builder) ForwardDecode(ctx *context.Context, newTokenID, positionID, al
 	hidden = common.RMSNorm(ctx.In("norm"), hidden, cfg.RMSNormEps)
 
 	// LM head — single token, logits are [batch, 1, vocabSize].
-	logits := b.applyLMHead(ctx, hidden, g)
+	logits := b.ApplyLMHead(ctx, hidden, g)
 	vocabSize := logits.Shape().Dimensions[2]
 	logits = Reshape(logits, vocabSize)
 
@@ -498,9 +540,9 @@ func (b *Builder) buildAttentionPrefill(ctx *context.Context, hidden, positionID
 	kvHeads := cfg.KVHeads()
 	headsPerGroup := cfg.HeadsPerKVGroup()
 
-	query := common.DenseWeightOnly(attnCtx.In("query"), hidden)
-	key := common.DenseWeightOnly(attnCtx.In("key"), hidden)
-	value := common.DenseWeightOnly(attnCtx.In("value"), hidden)
+	query := b.denseOrQuantized(attnCtx.In("query"), hidden)
+	key := b.denseOrQuantized(attnCtx.In("key"), hidden)
+	value := b.denseOrQuantized(attnCtx.In("value"), hidden)
 
 	query = Reshape(query, batchSize, seqLen, cfg.NumAttentionHeads, headDim)
 	query = Transpose(query, 1, 2)
@@ -514,7 +556,8 @@ func (b *Builder) buildAttentionPrefill(ctx *context.Context, hidden, positionID
 	query = common.RMSNorm(attnCtx.In("q_norm"), query, cfg.RMSNormEps)
 	key = common.RMSNorm(attnCtx.In("k_norm"), key, cfg.RMSNormEps)
 
-	query, key = common.RoPE(query, key, positionIDs, cfg.RopeTheta, seqLen, headDim)
+	ropeTheta := cfg.RopeFreqBase(layerIdx)
+	query, key = common.RoPE(query, key, positionIDs, ropeTheta, seqLen, headDim)
 
 	// Save K/V for cache (before GQA expansion).
 	cachedKeys := key
@@ -544,7 +587,7 @@ func (b *Builder) buildAttentionPrefill(ctx *context.Context, hidden, positionID
 	attnOutput = Transpose(attnOutput, 1, 2)
 	attnOutput = Reshape(attnOutput, batchSize, seqLen, cfg.NumAttentionHeads*headDim)
 
-	attnOutput = common.DenseWeightOnly(attnCtx.In("output"), attnOutput)
+	attnOutput = b.denseOrQuantized(attnCtx.In("output"), attnOutput)
 
 	return attnOutput, cachedKeys, cachedValues
 }
@@ -566,9 +609,9 @@ func (b *Builder) buildAttentionDecode(ctx *context.Context, hidden, positionIDs
 	bufferLen := prevKeys.Shape().Dimensions[2]
 
 	// Q/K/V projections on single token.
-	query := common.DenseWeightOnly(attnCtx.In("query"), hidden)
-	key := common.DenseWeightOnly(attnCtx.In("key"), hidden)
-	value := common.DenseWeightOnly(attnCtx.In("value"), hidden)
+	query := b.denseOrQuantized(attnCtx.In("query"), hidden)
+	key := b.denseOrQuantized(attnCtx.In("key"), hidden)
+	value := b.denseOrQuantized(attnCtx.In("value"), hidden)
 
 	// Reshape: [batch, 1, proj_dim] -> [batch, heads, 1, headDim]
 	query = Reshape(query, batchSize, 1, cfg.NumAttentionHeads, headDim)
@@ -584,8 +627,9 @@ func (b *Builder) buildAttentionDecode(ctx *context.Context, hidden, positionIDs
 	query = common.RMSNorm(attnCtx.In("q_norm"), query, cfg.RMSNormEps)
 	key = common.RMSNorm(attnCtx.In("k_norm"), key, cfg.RMSNormEps)
 
-	// RoPE with explicit position.
-	query, key = common.RoPE(query, key, positionIDs, cfg.RopeTheta, 1, headDim)
+	// RoPE with explicit position — use per-layer theta.
+	ropeTheta := cfg.RopeFreqBase(layerIdx)
+	query, key = common.RoPE(query, key, positionIDs, ropeTheta, 1, headDim)
 
 	// Insert new K/V into buffer at kvInsertPos.
 	updatedKeys := DynamicUpdateSlice(prevKeys, key, []*Node{
@@ -616,7 +660,7 @@ func (b *Builder) buildAttentionDecode(ctx *context.Context, hidden, positionIDs
 	attnOutput = Transpose(attnOutput, 1, 2)
 	attnOutput = Reshape(attnOutput, batchSize, 1, cfg.NumAttentionHeads*headDim)
 
-	attnOutput = common.DenseWeightOnly(attnCtx.In("output"), attnOutput)
+	attnOutput = b.denseOrQuantized(attnCtx.In("output"), attnOutput)
 
 	return attnOutput, updatedKeys, updatedValues
 }
@@ -670,13 +714,13 @@ func (b *Builder) buildDecodeMask(g *Graph, bufferLen int, kvInsertPos *Node, la
 
 // applyLMHead applies the language model head (or tied embeddings).
 // hidden: [batch, seqLen, hiddenSize], returns [batch, seqLen, vocabSize].
-func (b *Builder) applyLMHead(ctx *context.Context, hidden *Node, g *Graph) *Node {
+func (b *Builder) ApplyLMHead(ctx *context.Context, hidden *Node, g *Graph) *Node {
 	cfg := b.config
 
 	lmHeadCtx := ctx.In("lm_head")
 	lmHeadVar := lmHeadCtx.GetVariableByScopeAndName(lmHeadCtx.Scope(), "weights")
 	if lmHeadVar != nil {
-		return common.DenseWeightOnly(lmHeadCtx, hidden)
+		return b.denseOrQuantized(lmHeadCtx, hidden)
 	}
 
 	// Tied embeddings: reuse token_embd.weight.
@@ -686,9 +730,21 @@ func (b *Builder) applyLMHead(ctx *context.Context, hidden *Node, g *Graph) *Nod
 		panic("gemma3: neither lm_head nor embeddings weights found")
 	}
 	embWeights := embVar.ValueGraph(g)
-	vocabSize := embVar.Shape().Dimensions[0]
 	batchSize := hidden.Shape().Dimensions[0]
 	seqLen := hidden.Shape().Dimensions[1]
+
+	if qt, ok := b.quantInfo["embeddings/embeddings"]; ok {
+		// Quantized tied embeddings: use QuantizedDense.
+		// GGML weights are [vocabSize, bytesPerRow] — already in the layout QuantizedDense expects.
+		quant := &Quantization{
+			Scheme:   backends.QuantGGML,
+			GGMLType: qt,
+		}
+		return nn.QuantizedDense(hidden, embWeights, quant, nil)
+	}
+
+	// Float tied embeddings.
+	vocabSize := embVar.Shape().Dimensions[0]
 	hiddenFlat := Reshape(hidden, batchSize*seqLen, cfg.HiddenSize)
 	logits := Einsum("bh,vh->bv", hiddenFlat, embWeights)
 	return Reshape(logits, batchSize, seqLen, vocabSize)

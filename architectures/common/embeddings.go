@@ -1,13 +1,16 @@
 package common
 
 import (
+	"fmt"
 	"math"
 
+	"github.com/gomlx/gomlx/backends"
 	"github.com/gomlx/gomlx/pkg/core/graph"
 	"github.com/gomlx/gomlx/pkg/core/dtypes"
 	"github.com/gomlx/gomlx/pkg/core/shapes"
 	"github.com/gomlx/gomlx/pkg/ml/context"
 	"github.com/gomlx/gomlx/pkg/ml/layers"
+	"github.com/gomlx/gomlx/pkg/ml/nn"
 )
 
 // Embedding retrieves embeddings from the context.
@@ -17,6 +20,40 @@ func Embedding(ctx *context.Context, inputIDs *graph.Node, vocabSize, hiddenSize
 
 	// Ensure 3D output: [batch, seq, hidden].
 	// layers.Embedding may return 2D when seq_len=1.
+	if embeddings.Shape().Rank() == 2 {
+		embeddings = graph.InsertAxes(embeddings, 1)
+	}
+
+	return embeddings
+}
+
+// QuantizedEmbedding performs a quantized embedding lookup using GGML-format weights.
+// Expects "embeddings" variable in scope as [vocabSize, bytesPerRow] Uint8.
+// Dequantizes only the selected rows on-the-fly (like llama.cpp's ggml_get_rows).
+// Returns [batch, seqLen, K] Float32 where K is the logical embedding dimension.
+func QuantizedEmbedding(ctx *context.Context, inputIDs *graph.Node, ggmlType backends.GGMLQuantType) *graph.Node {
+	g := inputIDs.Graph()
+
+	embVar := ctx.GetVariableByScopeAndName(ctx.Scope(), "embeddings")
+	if embVar == nil {
+		panic(fmt.Sprintf("QuantizedEmbedding: missing variable 'embeddings' in scope %q", ctx.Scope()))
+	}
+	table := embVar.ValueGraph(g)
+
+	// Prepare indices: add trailing dim of 1 if needed (Gather convention).
+	indices := inputIDs
+	inputShape := inputIDs.Shape()
+	if inputShape.IsScalar() || inputShape.Dimensions[inputShape.Rank()-1] != 1 {
+		indices = graph.InsertAxes(indices, -1)
+	}
+
+	quant := &graph.Quantization{
+		Scheme:   backends.QuantGGML,
+		GGMLType: ggmlType,
+	}
+	embeddings := nn.QuantizedGather(table, indices, quant)
+
+	// Ensure 3D output: [batch, seq, hidden].
 	if embeddings.Shape().Rank() == 2 {
 		embeddings = graph.InsertAxes(embeddings, 1)
 	}

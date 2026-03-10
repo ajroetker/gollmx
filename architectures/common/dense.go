@@ -3,6 +3,7 @@ package common
 import (
 	"fmt"
 
+	"github.com/gomlx/gomlx/backends"
 	. "github.com/gomlx/gomlx/pkg/core/graph"
 	"github.com/gomlx/gomlx/pkg/ml/context"
 	"github.com/gomlx/gomlx/pkg/ml/layers/activations"
@@ -115,4 +116,24 @@ func MLPWithGELU(ctx *context.Context, x *Node) *Node {
 	x = DenseWithBias(ctx.In("3"), x)
 
 	return x
+}
+
+// QuantizedDenseWeightOnly applies a quantized dense layer using GGML-format weights.
+// Expects variable "weights" in the context scope as [N, bytesPerRow] Uint8.
+// Unlike DenseWeightOnly, no transposition is performed — GGML weights go directly
+// to the QuantizedDense executor which handles the native block layout.
+func QuantizedDenseWeightOnly(ctx *context.Context, x *Node, ggmlType backends.GGMLQuantType) *Node {
+	g := x.Graph()
+
+	weightsVar := ctx.GetVariableByScopeAndName(ctx.Scope(), "weights")
+	if weightsVar == nil {
+		panic(fmt.Sprintf("QuantizedDenseWeightOnly: missing variable 'weights' in scope %q", ctx.Scope()))
+	}
+	weights := weightsVar.ValueGraph(g)
+
+	quant := &Quantization{
+		Scheme:   backends.QuantGGML,
+		GGMLType: ggmlType,
+	}
+	return nn.QuantizedDense(x, weights, quant, nil)
 }

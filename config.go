@@ -182,7 +182,7 @@ func ParseConfigFromGGUF(f *gguf.File) (*BaseConfig, error) {
 		if !ok {
 			return 0, false
 		}
-		return int(kv.Uint()), true
+		return int(kv.Uint64()), true
 	}
 
 	// Helper to read GGUF float metadata.
@@ -191,7 +191,7 @@ func ParseConfigFromGGUF(f *gguf.File) (*BaseConfig, error) {
 		if !ok {
 			return 0, false
 		}
-		return kv.Float(), true
+		return kv.Float64(), true
 	}
 
 	// Core dimensions.

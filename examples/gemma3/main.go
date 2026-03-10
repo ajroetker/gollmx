@@ -1,4 +1,5 @@
-// Command gemma3 generates text using a Gemma 3 model loaded from a GGUF file.
+// Command gemma3 generates text using a Gemma 3 model loaded from a GGUF file,
+// using the serving engine with engine-managed KV cache.
 //
 // Usage:
 //
@@ -10,23 +11,23 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
-	"math"
-	"math/rand/v2"
 	"os"
-	"sort"
 	"time"
 
-	. "github.com/gomlx/gomlx/pkg/core/graph"
 	"github.com/gomlx/gomlx/backends"
 	_ "github.com/gomlx/gomlx/backends/default"
-	"github.com/gomlx/gomlx/pkg/core/tensors"
-	"github.com/gomlx/gomlx/pkg/ml/context"
+	"github.com/gomlx/gomlx/pkg/core/dtypes"
+	mlctx "github.com/gomlx/gomlx/pkg/ml/context"
+	"github.com/ajroetker/huggingface-gomlx/kvcache"
+	"github.com/ajroetker/huggingface-gomlx/serving"
 
 	"github.com/gomlx/go-huggingface/hub"
 	"github.com/gomlx/go-huggingface/tokenizers"
+	"github.com/gomlx/go-huggingface/tokenizers/api"
 
 	models "github.com/ajroetker/huggingface-gomlx"
 	"github.com/ajroetker/huggingface-gomlx/architectures/gemma3"
@@ -39,8 +40,8 @@ var (
 	flagPrompt        = flag.String("prompt", "Write a short poem about the sea.", "User message for chat prompt.")
 	flagMaxTokens     = flag.Int("max-tokens", 100, "Maximum number of tokens to generate.")
 	flagMaxSeqLen     = flag.Int("max-seq-len", 256, "Maximum total sequence length (prompt + generated).")
-	flagTemperature   = flag.Float64("temperature", 0.8, "Sampling temperature (0 = greedy).")
-	flagTopK          = flag.Int("top-k", 64, "Top-k sampling (0 = disabled).")
+	flagBlockSize     = flag.Int("block-size", 16, "Paged KV cache block size (tokens per block).")
+	flagNumBlocks     = flag.Int("num-blocks", 0, "Total paged KV cache blocks (0 = auto from max-seq-len).")
 )
 
 func main() {
@@ -75,36 +76,28 @@ func main() {
 		log.Fatalf("Failed to load tokenizer: %v", err)
 	}
 
-	bosID := 2 // Gemma default BOS.
-	if id, err := tok.SpecialTokenID(tokenizers.TokBeginningOfSentence); err == nil {
-		bosID = id
-	}
-	eosID := 1 // Gemma default EOS.
-	if id, err := tok.SpecialTokenID(tokenizers.TokEndOfSentence); err == nil {
-		eosID = id
-	}
-
 	// Create backend.
 	backend := backends.MustNew()
 	fmt.Printf("Backend: %s\n", backend.Name())
 
 	// Load weights into context.
 	fmt.Println("Loading weights into context...")
-	ctx := context.New()
+	ctx := mlctx.New()
 	if err := model.LoadWeightsIntoContext(ctx); err != nil {
 		log.Fatalf("Failed to load weights: %v", err)
 	}
 
-	// Get the Gemma 3 builder.
+	// Get the Gemma 3 builder and create ModelFn.
 	builder, ok := model.Builder.(*gemma3.Builder)
 	if !ok {
 		log.Fatal("Model builder is not a Gemma 3 builder")
 	}
 	cfg := builder.Gemma3Config()
+	modelFn := builder.BuildModelFn()
 
 	// Tokenize prompt.
 	chatPrompt := formatChatPrompt(*flagPrompt)
-	promptTokens := tokenizePrompt(tok, chatPrompt, bosID)
+	promptTokens := tokenizePrompt(tok, chatPrompt)
 	fmt.Printf("Prompt: %q\n", *flagPrompt)
 	fmt.Printf("Prompt tokens: %d\n", len(promptTokens))
 
@@ -112,108 +105,96 @@ func main() {
 		log.Fatalf("Prompt (%d tokens) exceeds max sequence length (%d)", len(promptTokens), *flagMaxSeqLen)
 	}
 
-	// Build prefill and decode execution graphs.
-	fmt.Println("Building execution graphs...")
+	// Create the serving engine with paged KV cache.
+	engineCfg := serving.Config{
+		MaxSeqLen:    *flagMaxSeqLen,
+		MaxBatchSize: 1,
+	}
 
-	prefillExec := context.MustNewExec(backend, ctx.Reuse(),
-		func(ctx *context.Context, inputIDs, seqLenNode *Node) []*Node {
-			return builder.ForwardPrefill(ctx, inputIDs, seqLenNode)
-		},
+	eosID := int32(1) // Gemma default EOS.
+	if id, err := tok.SpecialTokenID(api.TokEndOfSentence); err == nil {
+		eosID = int32(id)
+	}
+
+	blockSize := *flagBlockSize
+	numBlocks := *flagNumBlocks
+	if numBlocks <= 0 {
+		// Auto: enough blocks for maxSeqLen with some headroom.
+		numBlocks = (*flagMaxSeqLen/blockSize + 1) * 2
+	}
+
+	cacheDType := dtypes.BFloat16
+	if backend.Name() == "SimpleGo (go)" {
+		// SimpleGo doesn't support mixed-precision DotGeneral; use Float32.
+		cacheDType = dtypes.Float32
+	}
+	pagedCfg := kvcache.PagedKVCacheConfig{
+		NumBlocks:  numBlocks,
+		BlockSize:  blockSize,
+		NumKVHeads: cfg.KVHeads(),
+		HeadDim:    cfg.HeadDim,
+		DType:      cacheDType,
+	}
+	fmt.Printf("Paged KV cache: %d blocks x %d tokens, %d KV heads x %d dim\n",
+		numBlocks, blockSize, cfg.KVHeads(), cfg.HeadDim)
+
+	engineTok := &servingTokenizer{tok: tok, eosID: eosID}
+	engine := serving.NewPaged(
+		backend, ctx, modelFn, engineTok, engineCfg, pagedCfg,
 	)
-	prefillExec.SetMaxCache(10)
+	defer engine.Stop()
 
-	decodeExec := context.MustNewExec(backend, ctx.Reuse(),
-		func(ctx *context.Context, tokenID, posID, keys, values, insertPos *Node) []*Node {
-			return builder.ForwardDecode(ctx, tokenID, posID, keys, values, insertPos)
-		},
-	)
-	decodeExec.SetMaxCache(10)
-
-	// --- Prefill ---
+	// Submit the request.
 	fmt.Println("\nGenerating...")
 	startTime := time.Now()
 
-	promptIDs := make([]int64, len(promptTokens))
-	for i, t := range promptTokens {
-		promptIDs[i] = int64(t)
-	}
-
-	prefillResults := prefillExec.MustExec(
-		[][]int64{promptIDs}, // inputIDs [1, seqLen]
-		int32(len(promptTokens)), // seqLen
+	outputCh, errCh, err := engine.Submit(
+		context.Background(),
+		promptTokens,
+		serving.RequestOptions{MaxNewTokens: *flagMaxTokens},
+		nil,
 	)
-	logitsTensor := prefillResults[0]
-	kvKeys := prefillResults[1]
-	kvValues := prefillResults[2]
-
-	prefillDuration := time.Since(startTime)
-
-	// Sample first token.
-	logits := tensors.MustCopyFlatData[float32](logitsTensor)
-	nextToken := sampleToken(logits, *flagTemperature, *flagTopK)
-
-	// Print first token.
-	tokenText := tok.Decode([]int{int(nextToken)})
-	fmt.Print(tokenText)
-
-	if int(nextToken) == eosID || tokenText == "<end_of_turn>" {
-		fmt.Printf("\n\n--- Prefill: %d tokens in %.2fs ---\n", len(promptTokens), prefillDuration.Seconds())
-		return
+	if err != nil {
+		log.Fatalf("Submit failed: %v", err)
 	}
 
-	// --- Decode loop ---
-	realKVLen := len(promptTokens)
-	numGenerated := 1
-	decodeStart := time.Now()
-
-	// Pad KV cache to full max sequence length upfront to avoid repeated
-	// graph recompilation from changing buffer shapes mid-generation.
-	bufferSize := *flagMaxSeqLen
-	kvKeys = growKVBuffer(backend, kvKeys, bufferSize, cfg.KVHeads(), cfg.HeadDim)
-	kvValues = growKVBuffer(backend, kvValues, bufferSize, cfg.KVHeads(), cfg.HeadDim)
-
-	for i := 0; i < *flagMaxTokens-1; i++ {
-		if realKVLen+1 >= *flagMaxSeqLen {
-			break
-		}
-
-		results := decodeExec.MustExec(
-			[][]int64{{int64(nextToken)}},      // tokenID [1, 1]
-			[][]int64{{int64(realKVLen)}},       // positionID [1, 1]
-			kvKeys,                              // allKeys
-			kvValues,                            // allValues
-			int32(realKVLen),                    // kvInsertPos
-		)
-		logitsTensor = results[0]
-		kvKeys = results[1]
-		kvValues = results[2]
-		realKVLen++
+	// Stream output.
+	numGenerated := 0
+	for delta := range outputCh {
+		fmt.Print(delta.Token)
 		numGenerated++
-
-		logits = tensors.MustCopyFlatData[float32](logitsTensor)
-		nextToken = sampleToken(logits, *flagTemperature, *flagTopK)
-
-		tokenText = tok.Decode([]int{int(nextToken)})
-		if int(nextToken) == eosID || tokenText == "<end_of_turn>" {
+		if delta.Token == "<end_of_turn>" {
 			break
 		}
-		fmt.Print(tokenText)
 	}
 
-	decodeDuration := time.Since(decodeStart)
+	// Check for errors.
+	if err := <-errCh; err != nil {
+		log.Fatalf("Generation error: %v", err)
+	}
+
 	totalDuration := time.Since(startTime)
-
 	fmt.Println("\n\n---")
-	fmt.Printf("Prefill: %d tokens in %.2fs (%.1f tokens/s)\n",
-		len(promptTokens), prefillDuration.Seconds(),
-		float64(len(promptTokens))/prefillDuration.Seconds())
-	if numGenerated > 1 {
-		fmt.Printf("Decode:  %d tokens in %.2fs (%.1f tokens/s)\n",
-			numGenerated-1, decodeDuration.Seconds(),
-			float64(numGenerated-1)/decodeDuration.Seconds())
-	}
-	fmt.Printf("Total:   %d tokens in %.2fs\n", numGenerated, totalDuration.Seconds())
+	fmt.Printf("Generated %d tokens in %.2fs (%.1f tokens/s)\n",
+		numGenerated, totalDuration.Seconds(),
+		float64(numGenerated)/totalDuration.Seconds())
 }
+
+// servingTokenizer wraps a HuggingFace tokenizer to implement serving.Tokenizer.
+type servingTokenizer struct {
+	tok   tokenizers.Tokenizer
+	eosID int32
+}
+
+func (t *servingTokenizer) Decode(tokenID int32) (string, error) {
+	return t.tok.Decode([]int{int(tokenID)}), nil
+}
+
+func (t *servingTokenizer) IsEOS(tokenID int32) bool {
+	return tokenID == t.eosID
+}
+
+func (t *servingTokenizer) Reset() {}
 
 // formatChatPrompt wraps a user message in the Gemma 3 chat template.
 func formatChatPrompt(userMessage string) string {
@@ -221,7 +202,12 @@ func formatChatPrompt(userMessage string) string {
 }
 
 // tokenizePrompt encodes the prompt and prepends BOS.
-func tokenizePrompt(tok tokenizers.Tokenizer, prompt string, bosID int) []int32 {
+func tokenizePrompt(tok tokenizers.Tokenizer, prompt string) []int32 {
+	bosID := 2 // Gemma default BOS.
+	if id, err := tok.SpecialTokenID(api.TokBeginningOfSentence); err == nil {
+		bosID = id
+	}
+
 	encoded := tok.Encode(prompt)
 	tokens := make([]int32, 0, len(encoded)+1)
 	tokens = append(tokens, int32(bosID))
@@ -229,97 +215,4 @@ func tokenizePrompt(tok tokenizers.Tokenizer, prompt string, bosID int) []int32 
 		tokens = append(tokens, int32(t))
 	}
 	return tokens
-}
-
-// sampleToken samples a token from logits using temperature and top-k.
-func sampleToken(logits []float32, temperature float64, topK int) int32 {
-	if temperature <= 0 {
-		// Greedy: argmax.
-		maxIdx := 0
-		maxVal := logits[0]
-		for i, v := range logits {
-			if v > maxVal {
-				maxVal = v
-				maxIdx = i
-			}
-		}
-		return int32(maxIdx)
-	}
-
-	// Apply temperature.
-	scaled := make([]float32, len(logits))
-	for i, v := range logits {
-		scaled[i] = v / float32(temperature)
-	}
-
-	// Top-k filtering.
-	if topK > 0 && topK < len(scaled) {
-		// Find the top-k threshold.
-		sorted := make([]float32, len(scaled))
-		copy(sorted, scaled)
-		sort.Slice(sorted, func(i, j int) bool { return sorted[i] > sorted[j] })
-		threshold := sorted[topK-1]
-
-		for i := range scaled {
-			if scaled[i] < threshold {
-				scaled[i] = float32(math.Inf(-1))
-			}
-		}
-	}
-
-	// Softmax.
-	maxVal := float32(math.Inf(-1))
-	for _, v := range scaled {
-		if v > maxVal {
-			maxVal = v
-		}
-	}
-	var sum float64
-	probs := make([]float64, len(scaled))
-	for i, v := range scaled {
-		p := math.Exp(float64(v - maxVal))
-		probs[i] = p
-		sum += p
-	}
-	for i := range probs {
-		probs[i] /= sum
-	}
-
-	// Multinomial sample.
-	r := rand.Float64()
-	cumulative := 0.0
-	for i, p := range probs {
-		cumulative += p
-		if r < cumulative {
-			return int32(i)
-		}
-	}
-	return int32(len(probs) - 1)
-}
-
-// growKVBuffer pads the KV cache buffer to a new size along the sequence dimension.
-// kvTensor shape: [numLayers, batch, kvHeads, oldSeqLen, headDim]
-// Returns a tensor with shape: [numLayers, batch, kvHeads, newSeqLen, headDim]
-func growKVBuffer(backend backends.Backend, kvTensor *tensors.Tensor, newSeqLen, kvHeads, headDim int) *tensors.Tensor {
-	oldShape := kvTensor.Shape()
-	oldSeqLen := oldShape.Dimensions[3]
-	if newSeqLen <= oldSeqLen {
-		return kvTensor
-	}
-
-	numLayers := oldShape.Dimensions[0]
-	batchSize := oldShape.Dimensions[1]
-	padAmount := newSeqLen - oldSeqLen
-
-	padExec := context.MustNewExec(backend, context.New(),
-		func(_ *context.Context, kv *Node) *Node {
-			g := kv.Graph()
-			// Create a zero tensor for the padding region.
-			zeroPad := Const(g, make([]float32, numLayers*batchSize*kvHeads*padAmount*headDim))
-			zeroPad = Reshape(zeroPad, numLayers, batchSize, kvHeads, padAmount, headDim)
-			zeroPad = ConvertDType(zeroPad, kv.DType())
-			return Concatenate([]*Node{kv, zeroPad}, 3)
-		},
-	)
-	return padExec.MustExec(kvTensor)[0]
 }
