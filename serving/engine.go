@@ -14,7 +14,7 @@ import (
 	mlctx "github.com/gomlx/gomlx/pkg/ml/context"
 	"github.com/gomlx/gomlx/pkg/ml/decode"
 	"github.com/gomlx/gomlx/pkg/ml/decode/sample"
-	"github.com/ajroetker/huggingface-gomlx/kvcache"
+	"github.com/ajroetker/gollmx/kvcache"
 	"github.com/gomlx/gomlx/pkg/ml/layers/attention"
 )
 

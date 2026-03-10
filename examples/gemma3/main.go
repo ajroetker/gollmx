@@ -22,15 +22,15 @@ import (
 	_ "github.com/gomlx/gomlx/backends/default"
 	"github.com/gomlx/gomlx/pkg/core/dtypes"
 	mlctx "github.com/gomlx/gomlx/pkg/ml/context"
-	"github.com/ajroetker/huggingface-gomlx/kvcache"
-	"github.com/ajroetker/huggingface-gomlx/serving"
+	"github.com/ajroetker/gollmx/kvcache"
+	"github.com/ajroetker/gollmx/serving"
 
 	"github.com/gomlx/go-huggingface/hub"
 	"github.com/gomlx/go-huggingface/tokenizers"
 	"github.com/gomlx/go-huggingface/tokenizers/api"
 
-	models "github.com/ajroetker/huggingface-gomlx"
-	"github.com/ajroetker/huggingface-gomlx/architectures/gemma3"
+	models "github.com/ajroetker/gollmx"
+	"github.com/ajroetker/gollmx/architectures/gemma3"
 )
 
 var (

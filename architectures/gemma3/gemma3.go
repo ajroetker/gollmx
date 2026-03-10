@@ -27,8 +27,8 @@ import (
 	"github.com/gomlx/gomlx/pkg/ml/layers/activations"
 	"github.com/gomlx/gomlx/pkg/ml/nn"
 
-	models "github.com/ajroetker/huggingface-gomlx"
-	"github.com/ajroetker/huggingface-gomlx/architectures/common"
+	models "github.com/ajroetker/gollmx"
+	"github.com/ajroetker/gollmx/architectures/common"
 )
 
 func init() {

@@ -15,9 +15,9 @@ import (
 
 	"github.com/gomlx/go-huggingface/models/gguf"
 
-	models "github.com/ajroetker/huggingface-gomlx"
-	"github.com/ajroetker/huggingface-gomlx/architectures/common"
-	"github.com/ajroetker/huggingface-gomlx/architectures/gemma3"
+	models "github.com/ajroetker/gollmx"
+	"github.com/ajroetker/gollmx/architectures/common"
+	"github.com/ajroetker/gollmx/architectures/gemma3"
 )
 
 // TestQuantizedEmbeddingAccuracy compares the quantized embedding gather output

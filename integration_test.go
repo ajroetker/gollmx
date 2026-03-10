@@ -15,11 +15,11 @@ import (
 	"github.com/gomlx/gomlx/pkg/ml/context"
 	"github.com/stretchr/testify/require"
 
-	"github.com/ajroetker/huggingface-gomlx"
-	"github.com/ajroetker/huggingface-gomlx/architectures/bert"
+	"github.com/ajroetker/gollmx"
+	"github.com/ajroetker/gollmx/architectures/bert"
 
 	// Import architectures to register them.
-	_ "github.com/ajroetker/huggingface-gomlx/architectures/bert"
+	_ "github.com/ajroetker/gollmx/architectures/bert"
 )
 
 // getBackend returns the simplego backend for testing.

@@ -10,7 +10,7 @@ import (
 	"github.com/gomlx/gomlx/pkg/core/tensors"
 	mlctx "github.com/gomlx/gomlx/pkg/ml/context"
 	"github.com/gomlx/gomlx/pkg/ml/context/initializers"
-	"github.com/ajroetker/huggingface-gomlx/kvcache"
+	"github.com/ajroetker/gollmx/kvcache"
 	"github.com/gomlx/gomlx/pkg/ml/layers/attention"
 )
 

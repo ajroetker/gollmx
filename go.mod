@@ -1,4 +1,4 @@
-module github.com/ajroetker/huggingface-gomlx
+module github.com/ajroetker/gollmx
 
 go 1.26
 

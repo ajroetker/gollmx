@@ -20,12 +20,12 @@ import (
 	"github.com/gomlx/gomlx/pkg/ml/layers/attention"
 	"github.com/gomlx/gomlx/pkg/ml/nn"
 
-	models "github.com/ajroetker/huggingface-gomlx"
-	"github.com/ajroetker/huggingface-gomlx/architectures/common"
-	"github.com/ajroetker/huggingface-gomlx/architectures/gemma3"
+	models "github.com/ajroetker/gollmx"
+	"github.com/ajroetker/gollmx/architectures/common"
+	"github.com/ajroetker/gollmx/architectures/gemma3"
 	"github.com/gomlx/go-huggingface/models/gguf"
-	"github.com/ajroetker/huggingface-gomlx/kvcache"
-	"github.com/ajroetker/huggingface-gomlx/serving"
+	"github.com/ajroetker/gollmx/kvcache"
+	"github.com/ajroetker/gollmx/serving"
 )
 
 // loadModel loads the GGUF model and returns the builder and context.
