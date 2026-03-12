@@ -1,8 +1,8 @@
 package models
 
 import (
-	"fmt"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/gomlx/go-huggingface/hub"
@@ -136,20 +136,36 @@ func NewFromGGUF(path string) (*Model, error) {
 	}, nil
 }
 
-// NewFromGGUFRepo creates a Model from a HuggingFace repo containing a GGUF file.
-func NewFromGGUFRepo(repo *hub.Repo) (*Model, error) {
+// NewFromGGUFRepo creates a Model from a HuggingFace repo containing GGUF files.
+// If filenames are specified, only those files are downloaded. Otherwise, all
+// .gguf files in the repo are downloaded. For repos with many quantization
+// variants (e.g., second-state/Llava-v1.5-7B-GGUF), specify filenames to
+// avoid downloading all variants.
+func NewFromGGUFRepo(repo *hub.Repo, filenames ...string) (*Model, error) {
 	if err := repo.DownloadInfo(false); err != nil {
 		return nil, errors.Wrap(err, "failed to download repo info")
 	}
 
-	gm, err := gguf.New(repo)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to load GGUF from repo")
+	gm := gguf.NewEmpty(repo)
+	if len(filenames) > 0 {
+		if err := gm.LoadFiles(filenames...); err != nil {
+			return nil, errors.Wrap(err, "failed to load GGUF files from repo")
+		}
+	} else {
+		if err := gm.LoadAll(); err != nil {
+			return nil, errors.Wrap(err, "failed to load GGUF from repo")
+		}
 	}
 
 	config, err := ParseConfigFromGGUF(gm.File)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to parse config from GGUF metadata")
+	}
+
+	// For multimodal models (e.g., LLaVA), the vision config may be in a
+	// separate mmproj GGUF file with "clip" architecture.
+	for _, extra := range gm.ExtraFiles() {
+		mergeVisionConfigFromGGUF(config, extra)
 	}
 
 	builder, err := NewBuilder(config.ModelType)
@@ -185,16 +201,13 @@ func (m *Model) Summary() string {
 	sb.WriteString("Model Summary:\n")
 	sb.WriteString("  Architecture: " + m.Builder.Name() + "\n")
 	sb.WriteString("  Model Type: " + m.Config.ModelType + "\n")
-	sb.WriteString("  Hidden Size: " + itoa(m.Config.HiddenSize) + "\n")
-	sb.WriteString("  Num Layers: " + itoa(m.Config.NumHiddenLayers) + "\n")
-	sb.WriteString("  Num Heads: " + itoa(m.Config.NumAttentionHeads) + "\n")
-	sb.WriteString("  Vocab Size: " + itoa(m.Config.VocabSize) + "\n")
+	sb.WriteString("  Hidden Size: " + strconv.Itoa(m.Config.HiddenSize) + "\n")
+	sb.WriteString("  Num Layers: " + strconv.Itoa(m.Config.NumHiddenLayers) + "\n")
+	sb.WriteString("  Num Heads: " + strconv.Itoa(m.Config.NumAttentionHeads) + "\n")
+	sb.WriteString("  Vocab Size: " + strconv.Itoa(m.Config.VocabSize) + "\n")
 	if m.Weights != nil {
-		sb.WriteString("  Tensors: " + itoa(len(m.Weights.ListTensorNames())) + "\n")
+		sb.WriteString("  Tensors: " + strconv.Itoa(len(m.Weights.ListTensorNames())) + "\n")
 	}
 	return sb.String()
 }
 
-func itoa(i int) string {
-	return fmt.Sprintf("%d", i)
-}

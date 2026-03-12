@@ -1,7 +1,6 @@
-package llama
+package phi3
 
 import (
-	"fmt"
 	"math"
 	"strconv"
 
@@ -16,9 +15,7 @@ import (
 )
 
 // BuildModelFn returns a decode.ModelFn that uses KVCacheAccessor for
-// engine-managed KV cache. This enables the serving engine to control
-// cache layout (flat, paged) and transparently apply compaction,
-// prefix caching, and other optimizations.
+// engine-managed KV cache.
 func (b *Builder) BuildModelFn() decode.ModelFn {
 	return func(ctx *context.Context, tokens *Node, positions *Node, kv attention.KVCacheAccessor, aux *decode.AuxInputs) *Node {
 		cfg := b.config
@@ -49,7 +46,7 @@ func (b *Builder) BuildModelFn() decode.ModelFn {
 		}
 
 		hidden = common.RMSNorm(ctx.In("norm"), hidden, cfg.RMSNormEps)
-		return b.ApplyLMHead(ctx, hidden)
+		return b.ApplyLMHead(ctx, hidden, g)
 	}
 }
 
@@ -93,8 +90,16 @@ func (b *Builder) attentionWithKV(ctx *context.Context, hidden, positionIDs *Nod
 	value = Reshape(value, batchSize, seqLen, kvHeads, headDim)
 	value = Transpose(value, 1, 2)
 
-	// RoPE.
-	query, key = common.RoPE(query, key, positionIDs, cfg.RopeTheta, seqLen, headDim)
+	// RoPE (supports partial rotary and LongRoPE).
+	ropeCfg := common.RoPEConfig{
+		Theta:         cfg.RopeTheta,
+		HeadDim:       headDim,
+		RotaryDim:     cfg.RotaryDim(),
+		LongFactors:   cfg.LongRoPELongFactor,
+		ShortFactors:  cfg.LongRoPEShortFactor,
+		OrigMaxSeqLen: cfg.OrigMaxSeqLen,
+	}
+	query, key = common.RoPEWithConfig(query, key, positionIDs, seqLen, ropeCfg)
 
 	// Store K/V in cache and retrieve full cached K/V.
 	cachedKey, cachedValue := kv.WriteRead(attnCtx, g, key, value)
@@ -119,10 +124,7 @@ func (b *Builder) attentionWithKV(ctx *context.Context, hidden, positionIDs *Nod
 // Returns a mask shaped [batch, 1, seqLen, keySeqLen] where true = attend.
 func (b *Builder) buildBooleanMask(g *Graph, kv attention.KVCacheAccessor, aux *decode.AuxInputs, seqLen, keySeqLen int) *Node {
 	if seqLen > 1 {
-		// Prefill: use full causal mask [1, 1, seqLen, keySeqLen].
-		if keySeqLen < seqLen {
-			panic(fmt.Sprintf("llama: keySeqLen (%d) < seqLen (%d) during prefill", keySeqLen, seqLen))
-		}
+		// Prefill: use full causal mask.
 		causalMask := LowerTriangular(g, seqLen)
 		causalMask = Reshape(causalMask, 1, 1, seqLen, seqLen)
 

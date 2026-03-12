@@ -8,6 +8,7 @@ package bert
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	. "github.com/gomlx/gomlx/pkg/core/graph"
@@ -205,7 +206,7 @@ func (b *Builder) BuildEncoder(ctx *context.Context, hidden, attentionMask *Node
 	encCtx := ctx.In("encoder")
 
 	for i := 0; i < b.config.NumHiddenLayers; i++ {
-		hidden = b.BuildEncoderLayer(encCtx.In("layer").In(itoa(i)), hidden, attentionMask)
+		hidden = b.BuildEncoderLayer(encCtx.In("layer").In(strconv.Itoa(i)), hidden, attentionMask)
 	}
 
 	return hidden
@@ -280,6 +281,3 @@ func (b *Builder) GetVariableShape(name string) shapes.Shape {
 	}
 }
 
-func itoa(i int) string {
-	return fmt.Sprintf("%d", i)
-}

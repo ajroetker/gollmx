@@ -52,7 +52,7 @@ func TestMergeImageFeatures(t *testing.T) {
 	ctx := mlctx.New()
 	exec, err := mlctx.NewExec(backend, ctx,
 		func(ctx *mlctx.Context, hidden *Node, imageFeatures *Node, tokensNode *Node) *Node {
-			return common.MergeImageFeatures(hidden, imageFeatures, tokensNode, gemma3ImageTokenID)
+			return common.MergeImageFeatures(hidden, imageFeatures, tokensNode, 262144)
 		})
 	if err != nil {
 		t.Fatalf("NewExec: %v", err)

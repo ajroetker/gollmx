@@ -149,6 +149,25 @@ func (c *BaseConfig) GetStringSlice(key string) ([]string, bool) {
 	return nil, false
 }
 
+// EOSTokenID returns the end-of-sequence token ID from GGUF metadata, or 0 if not set.
+func (c *BaseConfig) EOSTokenID() int {
+	v, _ := c.GetInt("eos_token_id")
+	return v
+}
+
+// BOSTokenID returns the beginning-of-sequence token ID from GGUF metadata, or 0 if not set.
+func (c *BaseConfig) BOSTokenID() int {
+	v, _ := c.GetInt("bos_token_id")
+	return v
+}
+
+// SpecialTokenID returns a special token ID by its config key name, or (0, false) if not found.
+// Common keys: "image_token_id", "start_of_image_token_id", "end_of_image_token_id",
+// "start_of_turn_token_id", "end_of_turn_token_id".
+func (c *BaseConfig) SpecialTokenID(key string) (int, bool) {
+	return c.GetInt(key)
+}
+
 // HeadDim returns the dimension of each attention head.
 // If an explicit head_dim is set in Raw config, it is used (e.g., Gemma 3).
 // Otherwise falls back to hidden_size / num_attention_heads.
@@ -211,9 +230,11 @@ func ParseConfigFromGGUF(f *gguf.File) (*BaseConfig, error) {
 		config.MaxPositionEmbeddings = v
 	}
 
-	// Vocab size from tokenizer metadata.
+	// Vocab size and special tokens from tokenizer metadata.
 	if kv, ok := f.GetKeyValue("tokenizer.ggml.tokens"); ok {
-		config.VocabSize = len(kv.Strings())
+		tokens := kv.Strings()
+		config.VocabSize = len(tokens)
+		extractSpecialTokens(config, f, tokens)
 	}
 
 	// Normalization epsilon.
@@ -241,31 +262,143 @@ func ParseConfigFromGGUF(f *gguf.File) (*BaseConfig, error) {
 		config.Raw["rms_norm_eps"] = v
 	}
 
-	// Vision encoder metadata (e.g., SigLIP for Gemma 3 multimodal).
-	if v, ok := getInt(arch + ".vision.block_count"); ok {
-		config.Raw["vision.block_count"] = float64(v)
-	}
-	if v, ok := getInt(arch + ".vision.embedding_length"); ok {
-		config.Raw["vision.embedding_length"] = float64(v)
-	}
-	if v, ok := getInt(arch + ".vision.attention.head_count"); ok {
-		config.Raw["vision.attention.head_count"] = float64(v)
-	}
-	if v, ok := getInt(arch + ".vision.feed_forward_length"); ok {
-		config.Raw["vision.feed_forward_length"] = float64(v)
-	}
-	if v, ok := getInt(arch + ".vision.image_size"); ok {
-		config.Raw["vision.image_size"] = float64(v)
-	}
-	if v, ok := getInt(arch + ".vision.patch_size"); ok {
-		config.Raw["vision.patch_size"] = float64(v)
-	}
-	if v, ok := getInt(arch + ".vision.num_channels"); ok {
-		config.Raw["vision.num_channels"] = float64(v)
-	}
-	if v, ok := getFloat(arch + ".vision.attention.layer_norm_epsilon"); ok {
-		config.Raw["vision.attention.layer_norm_epsilon"] = v
+	// Partial rotary factor: GGUF stores rope.dimension_count = partial_rotary_factor * head_dim.
+	// We compute partial_rotary_factor = dimension_count / head_dim.
+	if v, ok := getInt(arch + ".rope.dimension_count"); ok {
+		headDim := 0
+		if hd, ok := getInt(arch + ".attention.key_length"); ok {
+			headDim = hd
+		} else if config.NumAttentionHeads > 0 {
+			headDim = config.HiddenSize / config.NumAttentionHeads
+		}
+		if headDim > 0 && v < headDim {
+			config.Raw["partial_rotary_factor"] = float64(v) / float64(headDim)
+		}
 	}
 
+	// Original max sequence length for LongRoPE threshold.
+	if v, ok := getInt(arch + ".rope.scaling.original_context_length"); ok {
+		config.Raw["original_max_position_embeddings"] = float64(v)
+	}
+
+	// Vision encoder metadata (e.g., SigLIP for Gemma 3 multimodal).
+	extractVisionMetadata(config, f, arch)
+
 	return config, nil
+}
+
+// extractVisionMetadata reads vision encoder metadata from a GGUF file and
+// stores it in config.Raw under normalized "vision.*" keys.
+func extractVisionMetadata(config *BaseConfig, f *gguf.File, arch string) {
+	ggufGetInt := func(key string) (int, bool) {
+		kv, ok := f.GetKeyValue(key)
+		if !ok {
+			return 0, false
+		}
+		return int(kv.Uint64()), true
+	}
+	ggufGetFloat := func(key string) (float64, bool) {
+		kv, ok := f.GetKeyValue(key)
+		if !ok {
+			return 0, false
+		}
+		return kv.Float64(), true
+	}
+
+	if v, ok := ggufGetInt(arch + ".vision.block_count"); ok {
+		config.Raw["vision.block_count"] = float64(v)
+	} else {
+		return // no vision config in this file
+	}
+	if v, ok := ggufGetInt(arch + ".vision.embedding_length"); ok {
+		config.Raw["vision.embedding_length"] = float64(v)
+	}
+	if v, ok := ggufGetInt(arch + ".vision.attention.head_count"); ok {
+		config.Raw["vision.attention.head_count"] = float64(v)
+	}
+	if v, ok := ggufGetInt(arch + ".vision.feed_forward_length"); ok {
+		config.Raw["vision.feed_forward_length"] = float64(v)
+	}
+	if v, ok := ggufGetInt(arch + ".vision.image_size"); ok {
+		config.Raw["vision.image_size"] = float64(v)
+	}
+	if v, ok := ggufGetInt(arch + ".vision.patch_size"); ok {
+		config.Raw["vision.patch_size"] = float64(v)
+	}
+	if v, ok := ggufGetInt(arch + ".vision.num_channels"); ok {
+		config.Raw["vision.num_channels"] = float64(v)
+	}
+	if v, ok := ggufGetFloat(arch + ".vision.attention.layer_norm_epsilon"); ok {
+		config.Raw["vision.attention.layer_norm_epsilon"] = v
+	}
+}
+
+// extractSpecialTokens reads special token IDs from GGUF metadata and vocabulary.
+// It stores them in config.Raw under standardized keys for architecture builders.
+func extractSpecialTokens(config *BaseConfig, f *gguf.File, tokens []string) {
+	// Read explicit special token IDs from GGUF metadata.
+	metadataTokenKeys := []string{
+		"tokenizer.ggml.bos_token_id",
+		"tokenizer.ggml.eos_token_id",
+		"tokenizer.ggml.padding_token_id",
+		"tokenizer.ggml.separator_token_id",
+	}
+	// Maps GGUF metadata key → config.Raw key.
+	metadataKeyMapping := map[string]string{
+		"tokenizer.ggml.bos_token_id":       "bos_token_id",
+		"tokenizer.ggml.eos_token_id":       "eos_token_id",
+		"tokenizer.ggml.padding_token_id":    "padding_token_id",
+		"tokenizer.ggml.separator_token_id":  "separator_token_id",
+	}
+	for _, key := range metadataTokenKeys {
+		if kv, ok := f.GetKeyValue(key); ok {
+			config.Raw[metadataKeyMapping[key]] = float64(kv.Uint64())
+		}
+	}
+
+	// Build reverse lookup: token string → ID.
+	tokenIndex := make(map[string]int, len(vocabTokensToFind))
+	for i, tok := range tokens {
+		if _, needed := vocabTokensToFind[tok]; needed {
+			tokenIndex[tok] = i
+		}
+	}
+
+	// Store found tokens in config.Raw.
+	for tok, rawKey := range vocabTokensToFind {
+		if id, ok := tokenIndex[tok]; ok {
+			config.Raw[rawKey] = float64(id)
+		}
+	}
+}
+
+// vocabTokensToFind maps token strings to their config.Raw key names.
+// These are resolved by scanning the tokenizer vocabulary.
+var vocabTokensToFind = map[string]string{
+	// Image placeholder tokens.
+	"<image>":      "image_token_id",
+	"<|image_1|>":  "image_token_id",
+	// Image framing tokens (Gemma 3).
+	"<start_of_image>": "start_of_image_token_id",
+	"<end_of_image>":   "end_of_image_token_id",
+	// Turn tokens (Gemma 3 chat template).
+	"<start_of_turn>": "start_of_turn_token_id",
+	"<end_of_turn>":   "end_of_turn_token_id",
+}
+
+// mergeVisionConfigFromGGUF extracts vision encoder metadata from an extra GGUF file
+// (e.g., an mmproj file with "clip" architecture) and merges it into the base config.
+// This is used for multimodal models like LLaVA where the vision encoder is in a separate file.
+func mergeVisionConfigFromGGUF(config *BaseConfig, f *gguf.File) {
+	arch := f.Architecture()
+	if arch == "" {
+		return
+	}
+
+	// Already have vision config from the primary file.
+	if _, ok := config.Raw["vision.block_count"]; ok {
+		return
+	}
+
+	extractVisionMetadata(config, f, arch)
 }

@@ -72,7 +72,7 @@ type GGUFSource struct {
 // Callers must handle quantized tensors appropriately (QuantizedDense for matmul,
 // QuantizedGather for embedding lookups, etc.).
 func (g *GGUFSource) GetTensor(name string) (*LoadedWeight, error) {
-	info, ok := g.Model.File.GetTensorInfo(name)
+	info, ok := g.Model.GetTensorInfo(name)
 	if !ok {
 		return nil, fmt.Errorf("gguf: tensor %q not found", name)
 	}

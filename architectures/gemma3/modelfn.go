@@ -32,7 +32,7 @@ func (b *Builder) BuildModelFn() decode.ModelFn {
 
 		// Merge image features into embeddings during prefill.
 		if aux != nil && aux.ImageFeatures != nil && seqLen > 1 {
-			hidden = common.MergeImageFeatures(hidden, aux.ImageFeatures, tokens, gemma3ImageTokenID)
+			hidden = common.MergeImageFeatures(hidden, aux.ImageFeatures, tokens, b.imageTokenID)
 		}
 
 		// Build position IDs [batch, seqLen] for RoPE.
@@ -57,9 +57,6 @@ func (b *Builder) BuildModelFn() decode.ModelFn {
 		return b.ApplyLMHead(ctx, hidden, g)
 	}
 }
-
-// gemma3ImageTokenID is the special token ID for <image> placeholders in Gemma 3.
-const gemma3ImageTokenID = int32(262144)
 
 // decoderLayerWithKV runs a single decoder layer using KVCacheAccessor.
 func (b *Builder) decoderLayerWithKV(ctx *context.Context, hidden, positionIDs *Node, kv attention.KVCacheAccessor, aux *decode.AuxInputs, layerIdx, seqLen int) *Node {

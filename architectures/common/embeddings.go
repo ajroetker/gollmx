@@ -136,29 +136,69 @@ func BuildRelativePositionEmbeddings(g *graph.Graph, relEmbeddings *graph.Node, 
 	return graph.Gather(relEmbeddings, indicesNode)
 }
 
+// RoPEConfig holds configuration for Rotary Position Embedding.
+type RoPEConfig struct {
+	Theta         float64   // Base frequency (e.g., 10000.0).
+	HeadDim       int       // Full dimension of each attention head.
+	RotaryDim     int       // Number of dimensions to apply RoPE to (0 = all). For partial_rotary_factor=0.75 with headDim=128, set to 96.
+	ScalingFactor float64   // Uniform scaling factor (divides all frequencies). 0 or 1 = no scaling.
+	LongFactors   []float32 // Per-dimension LongRoPE factors for long sequences (len = rotaryDim/2). Nil = unused.
+	ShortFactors  []float32 // Per-dimension LongRoPE factors for short sequences (len = rotaryDim/2). Nil = unused.
+	OrigMaxSeqLen int       // Original max sequence length for LongRoPE threshold. Sequences > this use LongFactors.
+}
+
 // RoPE applies Rotary Position Embedding to query and key tensors.
 // query/key shape: [batch, heads, seq, head_dim]
 // positionIDs shape: [batch, seq] or nil (will use sequential positions)
 // scalingFactor: for linear RoPE scaling, frequencies are divided by this factor.
 // Use 1.0 or 0.0 for no scaling.
 func RoPE(query, key *graph.Node, positionIDs *graph.Node, theta float64, seqLen, headDim int, scalingFactor ...float64) (*graph.Node, *graph.Node) {
+	cfg := RoPEConfig{
+		Theta:   theta,
+		HeadDim: headDim,
+	}
+	if len(scalingFactor) > 0 {
+		cfg.ScalingFactor = scalingFactor[0]
+	}
+	return RoPEWithConfig(query, key, positionIDs, seqLen, cfg)
+}
+
+// RoPEWithConfig applies Rotary Position Embedding with full configuration control.
+// Supports partial rotary (RotaryDim < HeadDim) and LongRoPE per-dimension scaling.
+// query/key shape: [batch, heads, seq, head_dim]
+// positionIDs shape: [batch, seq] or nil (will use sequential positions)
+func RoPEWithConfig(query, key *graph.Node, positionIDs *graph.Node, seqLen int, cfg RoPEConfig) (*graph.Node, *graph.Node) {
 	g := query.Graph()
 
-	// Apply linear RoPE scaling: divide frequencies by the factor.
-	// This stretches position encodings to support longer contexts.
-	factor := 1.0
-	if len(scalingFactor) > 0 && scalingFactor[0] > 1.0 {
-		factor = scalingFactor[0]
+	rotaryDim := cfg.HeadDim
+	if cfg.RotaryDim > 0 {
+		rotaryDim = cfg.RotaryDim
+	}
+	halfRotary := rotaryDim / 2
+
+	// Compute base inverse frequencies: freq_i = theta^(-2i/d) for i in [0, rotaryDim/2).
+	invFreq := make([]float32, halfRotary)
+	for i := range halfRotary {
+		invFreq[i] = float32(1.0 / math.Pow(cfg.Theta, float64(2*i)/float64(rotaryDim)))
 	}
 
-	// Compute rotary frequencies.
-	// freq_i = theta^(-2i/d) / factor for i in [0, d/2)
-	invFreq := make([]float32, headDim/2)
-	for i := 0; i < headDim/2; i++ {
-		invFreq[i] = float32(1.0 / (math.Pow(theta, float64(2*i)/float64(headDim)) * factor))
+	// Apply scaling: either per-dimension (LongRoPE) or uniform.
+	if cfg.LongFactors != nil && seqLen > cfg.OrigMaxSeqLen {
+		for i := range halfRotary {
+			invFreq[i] /= cfg.LongFactors[i]
+		}
+	} else if cfg.ShortFactors != nil && seqLen <= cfg.OrigMaxSeqLen {
+		for i := range halfRotary {
+			invFreq[i] /= cfg.ShortFactors[i]
+		}
+	} else if cfg.ScalingFactor > 1.0 {
+		for i := range halfRotary {
+			invFreq[i] /= float32(cfg.ScalingFactor)
+		}
 	}
+
 	invFreqNode := graph.Const(g, invFreq)
-	invFreqNode = graph.Reshape(invFreqNode, 1, 1, headDim/2) // [1, 1, head_dim/2]
+	invFreqNode = graph.Reshape(invFreqNode, 1, 1, halfRotary) // [1, 1, halfRotary]
 
 	// Create position indices.
 	var positions *graph.Node
@@ -167,45 +207,62 @@ func RoPE(query, key *graph.Node, positionIDs *graph.Node, theta float64, seqLen
 		positions = graph.Reshape(positions, positions.Shape().Dimensions[0], seqLen, 1) // [batch, seq, 1]
 	} else {
 		posArray := make([]float32, seqLen)
-		for i := 0; i < seqLen; i++ {
+		for i := range seqLen {
 			posArray[i] = float32(i)
 		}
 		positions = graph.Const(g, posArray)
 		positions = graph.Reshape(positions, 1, seqLen, 1) // [1, seq, 1]
 	}
 
-	// freqs = positions * inv_freq: [batch, seq, head_dim/2]
+	// freqs = positions * inv_freq: [batch, seq, halfRotary]
 	freqs := graph.Mul(positions, invFreqNode)
 
-	// Compute sin and cos.
 	sinFreqs := graph.Sin(freqs)
 	cosFreqs := graph.Cos(freqs)
 
-	// Expand for heads: [batch, 1, seq, head_dim/2]
+	// Expand for heads: [batch, 1, seq, halfRotary]
 	sinFreqs = graph.InsertAxes(sinFreqs, 1)
 	cosFreqs = graph.InsertAxes(cosFreqs, 1)
 
-	// Apply rotary embedding.
-	query = applyRotaryEmb(query, sinFreqs, cosFreqs, headDim)
-	key = applyRotaryEmb(key, sinFreqs, cosFreqs, headDim)
+	// Apply rotary embedding to the rotary dimensions.
+	if rotaryDim < cfg.HeadDim {
+		// Partial rotary: apply RoPE to first rotaryDim dims, pass through the rest.
+		query = applyPartialRotaryEmb(query, sinFreqs, cosFreqs, rotaryDim, cfg.HeadDim)
+		key = applyPartialRotaryEmb(key, sinFreqs, cosFreqs, rotaryDim, cfg.HeadDim)
+	} else {
+		query = applyRotaryEmb(query, sinFreqs, cosFreqs, rotaryDim)
+		key = applyRotaryEmb(key, sinFreqs, cosFreqs, rotaryDim)
+	}
 
 	return query, key
 }
 
 // applyRotaryEmb applies rotary embedding to a tensor.
 // x shape: [batch, heads, seq, head_dim]
-// sin/cos shape: [batch, 1, seq, head_dim/2]
-func applyRotaryEmb(x, sin, cos *graph.Node, headDim int) *graph.Node {
-	// Split into two halves.
-	x1 := graph.Slice(x, graph.AxisRange(), graph.AxisRange(), graph.AxisRange(), graph.AxisRange(0, headDim/2))
-	x2 := graph.Slice(x, graph.AxisRange(), graph.AxisRange(), graph.AxisRange(), graph.AxisRange(headDim/2, headDim))
+// sin/cos shape: [batch, 1, seq, rotaryDim/2]
+func applyRotaryEmb(x, sin, cos *graph.Node, rotaryDim int) *graph.Node {
+	half := rotaryDim / 2
+	x1 := graph.Slice(x, graph.AxisRange(), graph.AxisRange(), graph.AxisRange(), graph.AxisRange(0, half))
+	x2 := graph.Slice(x, graph.AxisRange(), graph.AxisRange(), graph.AxisRange(), graph.AxisRange(half, rotaryDim))
 
-	// Rotate: [x1, x2] -> [x1*cos - x2*sin, x2*cos + x1*sin]
 	rotatedX1 := graph.Sub(graph.Mul(x1, cos), graph.Mul(x2, sin))
 	rotatedX2 := graph.Add(graph.Mul(x2, cos), graph.Mul(x1, sin))
 
-	// Concatenate back.
 	return graph.Concatenate([]*graph.Node{rotatedX1, rotatedX2}, -1)
+}
+
+// applyPartialRotaryEmb applies rotary embedding to only the first rotaryDim
+// dimensions and passes through the remaining dimensions unchanged.
+func applyPartialRotaryEmb(x, sin, cos *graph.Node, rotaryDim, headDim int) *graph.Node {
+	half := rotaryDim / 2
+	xRot1 := graph.Slice(x, graph.AxisRange(), graph.AxisRange(), graph.AxisRange(), graph.AxisRange(0, half))
+	xRot2 := graph.Slice(x, graph.AxisRange(), graph.AxisRange(), graph.AxisRange(), graph.AxisRange(half, rotaryDim))
+	xPass := graph.Slice(x, graph.AxisRange(), graph.AxisRange(), graph.AxisRange(), graph.AxisRange(rotaryDim, headDim))
+
+	rotatedX1 := graph.Sub(graph.Mul(xRot1, cos), graph.Mul(xRot2, sin))
+	rotatedX2 := graph.Add(graph.Mul(xRot2, cos), graph.Mul(xRot1, sin))
+
+	return graph.Concatenate([]*graph.Node{rotatedX1, rotatedX2, xPass}, -1)
 }
 
 // CreateCausalMask creates a causal attention mask.

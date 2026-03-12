@@ -63,6 +63,11 @@ func (vc *VisionConfig) HeadDim() int {
 	return vc.HiddenSize / vc.NumHeads
 }
 
+// ImageTokenID returns the token ID used for image placeholders.
+func (b *Builder) ImageTokenID() int32 {
+	return b.imageTokenID
+}
+
 // HasVision returns true if the model has vision encoder weights loaded.
 func (b *Builder) HasVision() bool {
 	return b.visionConfig != nil

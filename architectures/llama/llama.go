@@ -11,15 +11,19 @@ package llama
 
 import (
 	"fmt"
+	"math"
+	"strconv"
 	"strings"
 
+	"github.com/gomlx/gomlx/backends"
 	. "github.com/gomlx/gomlx/pkg/core/graph"
 	"github.com/gomlx/gomlx/pkg/core/dtypes"
 	"github.com/gomlx/gomlx/pkg/core/shapes"
 	"github.com/gomlx/gomlx/pkg/ml/context"
 	"github.com/gomlx/gomlx/pkg/ml/layers/activations"
+	"github.com/gomlx/gomlx/pkg/ml/nn"
 
-	"github.com/gomlx/gollmx"
+	models "github.com/gomlx/gollmx"
 	"github.com/gomlx/gollmx/architectures/common"
 )
 
@@ -69,7 +73,12 @@ func (c *Config) HeadsPerKVGroup() int {
 
 // Builder implements the Llama architecture.
 type Builder struct {
-	config *Config
+	config          *Config
+	visionConfig    *common.VisionConfig // nil for text-only models
+	projectorLayers int                  // number of linear layers in MLP projector (default 2)
+	imageTokenID    int32                // token ID for <image> placeholder (from tokenizer)
+	isGGUF          bool
+	quantInfo       models.QuantInfo // scope path → GGML quant type
 }
 
 // Name returns the architecture name.
@@ -99,7 +108,47 @@ func (b *Builder) ParseConfig(base *models.BaseConfig) error {
 		b.config.MLPBias = v
 	}
 
+	// Parse vision config if present (LLaVA multimodal).
+	b.parseVisionConfig(base)
+
 	return nil
+}
+
+// parseVisionConfig extracts vision encoder configuration if available.
+func (b *Builder) parseVisionConfig(base *models.BaseConfig) {
+	if v, ok := base.GetInt("vision.block_count"); ok {
+		vc := &common.VisionConfig{NumLayers: v, UseGELU: true}
+		if v, ok := base.GetInt("vision.embedding_length"); ok {
+			vc.HiddenSize = v
+		}
+		if v, ok := base.GetInt("vision.attention.head_count"); ok {
+			vc.NumHeads = v
+		}
+		if v, ok := base.GetInt("vision.feed_forward_length"); ok {
+			vc.MLPDim = v
+		}
+		if v, ok := base.GetInt("vision.image_size"); ok {
+			vc.ImageSize = v
+		}
+		if v, ok := base.GetInt("vision.patch_size"); ok {
+			vc.PatchSize = v
+		}
+		if v, ok := base.GetInt("vision.num_channels"); ok {
+			vc.NumChannels = v
+		} else {
+			vc.NumChannels = 3
+		}
+		if v, ok := base.GetFloat("vision.attention.layer_norm_epsilon"); ok {
+			vc.LayerNormEps = v
+		} else {
+			vc.LayerNormEps = 1e-6
+		}
+		b.visionConfig = vc
+		b.projectorLayers = 2 // LLaVA default: 2-layer MLP (mlp2x_gelu)
+		if v, ok := base.GetInt("image_token_id"); ok {
+			b.imageTokenID = int32(v)
+		}
+	}
 }
 
 // Config returns the base configuration.
@@ -109,12 +158,116 @@ func (b *Builder) Config() *models.BaseConfig {
 
 // LoadWeights loads weights into the GoMLX context.
 func (b *Builder) LoadWeights(ctx *context.Context, weights models.WeightSource) error {
-	_, err := models.LoadWeightsFromMapping(weights, b.WeightMapping(), ctx)
-	return err
+	var mapping map[string]string
+	if _, ok := weights.(*models.GGUFSource); ok {
+		mapping = b.ggufWeightMapping()
+		b.isGGUF = true
+	} else {
+		mapping = b.hfWeightMapping()
+	}
+	quantInfo, err := models.LoadWeightsFromMapping(weights, mapping, ctx, models.LoadWeightsOptions{
+		ComputeDType: dtypes.Float32,
+	})
+	if err != nil {
+		return err
+	}
+	b.quantInfo = quantInfo
+	return nil
 }
 
-// WeightMapping returns the mapping from safetensors keys to context scope paths.
+// denseOrQuantized applies a weight-only dense layer, using QuantizedDense for
+// GGML-quantized weights or regular DenseWeightOnly for float weights.
+func (b *Builder) denseOrQuantized(ctx *context.Context, x *Node) *Node {
+	scopePath := strings.TrimPrefix(ctx.Scope(), "/") + "/weights"
+	if qt, ok := b.quantInfo[scopePath]; ok {
+		return common.QuantizedDenseWeightOnly(ctx, x, qt)
+	}
+	return common.DenseWeightOnly(ctx, x)
+}
+
+// WeightMapping returns the GGUF weight mapping (primary target).
 func (b *Builder) WeightMapping() map[string]string {
+	return b.ggufWeightMapping()
+}
+
+// ggufWeightMapping returns the mapping from GGUF tensor names to context scope paths.
+func (b *Builder) ggufWeightMapping() map[string]string {
+	mapping := make(map[string]string)
+	cfg := b.config
+
+	// Embeddings.
+	mapping["token_embd.weight"] = "embeddings/embeddings"
+
+	// Layers.
+	for i := 0; i < cfg.NumHiddenLayers; i++ {
+		blk := fmt.Sprintf("blk.%d", i)
+		scope := fmt.Sprintf("layers/%d", i)
+
+		mapping[blk+".attn_norm.weight"] = scope + "/input_norm/weight"
+		mapping[blk+".attn_q.weight"] = scope + "/attention/query/weights"
+		mapping[blk+".attn_k.weight"] = scope + "/attention/key/weights"
+		mapping[blk+".attn_v.weight"] = scope + "/attention/value/weights"
+		mapping[blk+".attn_output.weight"] = scope + "/attention/output/weights"
+		mapping[blk+".ffn_norm.weight"] = scope + "/post_attn_norm/weight"
+		mapping[blk+".ffn_gate.weight"] = scope + "/mlp/gate/weights"
+		mapping[blk+".ffn_up.weight"] = scope + "/mlp/up/weights"
+		mapping[blk+".ffn_down.weight"] = scope + "/mlp/down/weights"
+	}
+
+	// Final norm.
+	mapping["output_norm.weight"] = "norm/weight"
+
+	// LM head (may be absent if tied to embeddings).
+	mapping["output.weight"] = "lm_head/weights"
+
+	// Vision encoder weights (CLIP).
+	if b.visionConfig != nil {
+		vc := b.visionConfig
+
+		mapping["v.patch_embedding.weight"] = "vision/patch_embedding/weights"
+		mapping["v.patch_embedding.bias"] = "vision/patch_embedding/biases"
+		mapping["v.position_embedding.weight"] = "vision/position_embeddings"
+
+		for i := range vc.NumLayers {
+			src := fmt.Sprintf("v.blk.%d", i)
+			dst := fmt.Sprintf("vision/layers/%d", i)
+
+			mapping[src+".layer_norm1.weight"] = dst + "/layer_norm1/gain"
+			mapping[src+".layer_norm1.bias"] = dst + "/layer_norm1/offset"
+			mapping[src+".layer_norm2.weight"] = dst + "/layer_norm2/gain"
+			mapping[src+".layer_norm2.bias"] = dst + "/layer_norm2/offset"
+
+			mapping[src+".attn_q.weight"] = dst + "/attn_q/weights"
+			mapping[src+".attn_q.bias"] = dst + "/attn_q/biases"
+			mapping[src+".attn_k.weight"] = dst + "/attn_k/weights"
+			mapping[src+".attn_k.bias"] = dst + "/attn_k/biases"
+			mapping[src+".attn_v.weight"] = dst + "/attn_v/weights"
+			mapping[src+".attn_v.bias"] = dst + "/attn_v/biases"
+			mapping[src+".attn_output.weight"] = dst + "/attn_output/weights"
+			mapping[src+".attn_output.bias"] = dst + "/attn_output/biases"
+
+			mapping[src+".mlp.fc1.weight"] = dst + "/mlp/fc1/weights"
+			mapping[src+".mlp.fc1.bias"] = dst + "/mlp/fc1/biases"
+			mapping[src+".mlp.fc2.weight"] = dst + "/mlp/fc2/weights"
+			mapping[src+".mlp.fc2.bias"] = dst + "/mlp/fc2/biases"
+		}
+
+		mapping["v.post_layernorm.weight"] = "vision/post_layernorm/gain"
+		mapping["v.post_layernorm.bias"] = "vision/post_layernorm/offset"
+
+		// MLP projector: mm.0, mm.2 (2-layer), or mm.0, mm.2, mm.4 (3-layer).
+		for i := range b.projectorLayers {
+			idx := i * 2
+			mapping[fmt.Sprintf("mm.%d.weight", idx)] = fmt.Sprintf("mm/%d/weights", idx)
+			mapping[fmt.Sprintf("mm.%d.bias", idx)] = fmt.Sprintf("mm/%d/biases", idx)
+		}
+	}
+
+	return mapping
+}
+
+// hfWeightMapping returns the mapping from HuggingFace tensor names to context scope paths.
+func (b *Builder) hfWeightMapping() map[string]string {
 	mapping := make(map[string]string)
 	cfg := b.config
 	prefix := "model"
@@ -127,19 +280,12 @@ func (b *Builder) WeightMapping() map[string]string {
 		layerPrefix := fmt.Sprintf("%s.layers.%d", prefix, i)
 		layerScope := fmt.Sprintf("layers/%d", i)
 
-		// Input LayerNorm (RMSNorm).
 		mapping[layerPrefix+".input_layernorm.weight"] = layerScope + "/input_norm/weight"
-
-		// Self-attention.
 		mapping[layerPrefix+".self_attn.q_proj.weight"] = layerScope + "/attention/query/weights"
 		mapping[layerPrefix+".self_attn.k_proj.weight"] = layerScope + "/attention/key/weights"
 		mapping[layerPrefix+".self_attn.v_proj.weight"] = layerScope + "/attention/value/weights"
 		mapping[layerPrefix+".self_attn.o_proj.weight"] = layerScope + "/attention/output/weights"
-
-		// Post-attention LayerNorm (RMSNorm).
 		mapping[layerPrefix+".post_attention_layernorm.weight"] = layerScope + "/post_attn_norm/weight"
-
-		// MLP (gate-up-down projections).
 		mapping[layerPrefix+".mlp.gate_proj.weight"] = layerScope + "/mlp/gate/weights"
 		mapping[layerPrefix+".mlp.up_proj.weight"] = layerScope + "/mlp/up/weights"
 		mapping[layerPrefix+".mlp.down_proj.weight"] = layerScope + "/mlp/down/weights"
@@ -155,10 +301,16 @@ func (b *Builder) WeightMapping() map[string]string {
 }
 
 // BuildEmbeddings builds the embedding layer.
+// For quantized GGUF models, uses QuantizedEmbedding to dequantize only selected rows.
 func (b *Builder) BuildEmbeddings(ctx *context.Context, inputIDs *Node) *Node {
 	embCtx := ctx.In("embeddings")
 
-	// Word embeddings only (Llama uses RoPE for positions).
+	if qt, ok := b.quantInfo["embeddings/embeddings"]; ok {
+		return common.QuantizedEmbedding(embCtx, inputIDs, qt)
+	}
+	if v := embCtx.GetVariableByScopeAndName(embCtx.Scope(), "embeddings"); v != nil {
+		return common.EmbeddingFromVar(embCtx, inputIDs, v)
+	}
 	return common.Embedding(embCtx, inputIDs, b.config.VocabSize, b.config.HiddenSize)
 }
 
@@ -175,9 +327,9 @@ func (b *Builder) BuildAttention(ctx *context.Context, hidden, attentionMask, po
 	headsPerGroup := cfg.HeadsPerKVGroup()
 
 	// Q, K, V projections (no bias in Llama).
-	query := common.DenseWeightOnly(attnCtx.In("query"), hidden)
-	key := common.DenseWeightOnly(attnCtx.In("key"), hidden)
-	value := common.DenseWeightOnly(attnCtx.In("value"), hidden)
+	query := b.denseOrQuantized(attnCtx.In("query"), hidden)
+	key := b.denseOrQuantized(attnCtx.In("key"), hidden)
+	value := b.denseOrQuantized(attnCtx.In("value"), hidden)
 
 	// Reshape for multi-head attention.
 	// Query: [batch, seq, hidden] -> [batch, heads, seq, head_dim]
@@ -204,8 +356,8 @@ func (b *Builder) BuildAttention(ctx *context.Context, hidden, attentionMask, po
 
 	// Attention scores: Q @ K^T / sqrt(d_k)
 	scores := Einsum("bhqd,bhkd->bhqk", query, key)
-	scale := ConstAs(scores, 1.0/float64(headDim))
-	scores = Mul(scores, Sqrt(scale))
+	scale := ConstAs(scores, 1.0/math.Sqrt(float64(headDim)))
+	scores = Mul(scores, scale)
 
 	// Apply causal mask.
 	causalMask := common.CreateCausalMask(g, seqLen, scores.DType())
@@ -226,7 +378,7 @@ func (b *Builder) BuildAttention(ctx *context.Context, hidden, attentionMask, po
 	attnOutput = Reshape(attnOutput, batchSize, seqLen, cfg.HiddenSize)
 
 	// Output projection.
-	attnOutput = common.DenseWeightOnly(attnCtx.In("output"), attnOutput)
+	attnOutput = b.denseOrQuantized(attnCtx.In("output"), attnOutput)
 
 	return attnOutput
 }
@@ -236,15 +388,13 @@ func (b *Builder) BuildAttention(ctx *context.Context, hidden, attentionMask, po
 func (b *Builder) BuildMLP(ctx *context.Context, hidden *Node) *Node {
 	mlpCtx := ctx.In("mlp")
 
-	// SwiGLU: gate * SiLU(up) then down projection
-	gate := common.DenseWeightOnly(mlpCtx.In("gate"), hidden)
-	up := common.DenseWeightOnly(mlpCtx.In("up"), hidden)
-
-	// SwiGLU activation: gate * SiLU(up)
+	// SwiGLU: SiLU(gate) * up, then down projection.
+	gate := b.denseOrQuantized(mlpCtx.In("gate"), hidden)
+	up := b.denseOrQuantized(mlpCtx.In("up"), hidden)
 	activated := Mul(activations.Swish(gate), up)
 
 	// Down projection.
-	return common.DenseWeightOnly(mlpCtx.In("down"), activated)
+	return b.denseOrQuantized(mlpCtx.In("down"), activated)
 }
 
 // BuildDecoderLayer builds a single decoder layer.
@@ -271,7 +421,7 @@ func (b *Builder) BuildDecoderLayer(ctx *context.Context, hidden, attentionMask,
 // BuildDecoder builds the full decoder stack.
 func (b *Builder) BuildDecoder(ctx *context.Context, hidden, attentionMask, positionIDs *Node) *Node {
 	for i := 0; i < b.config.NumHiddenLayers; i++ {
-		hidden = b.BuildDecoderLayer(ctx.In("layers").In(itoa(i)), hidden, attentionMask, positionIDs)
+		hidden = b.BuildDecoderLayer(ctx.In("layers").In(strconv.Itoa(i)), hidden, attentionMask, positionIDs)
 	}
 
 	// Final normalization.
@@ -328,6 +478,45 @@ func (b *Builder) GetVariableShape(name string) shapes.Shape {
 	}
 }
 
-func itoa(i int) string {
-	return fmt.Sprintf("%d", i)
+// ApplyLMHead applies the language model head (or tied embeddings).
+func (b *Builder) ApplyLMHead(ctx *context.Context, hidden *Node) *Node {
+	g := hidden.Graph()
+
+	lmHeadCtx := ctx.In("lm_head")
+	lmHeadVar := lmHeadCtx.GetVariableByScopeAndName(lmHeadCtx.Scope(), "weights")
+	if lmHeadVar != nil {
+		return b.denseOrQuantized(lmHeadCtx, hidden)
+	}
+
+	// Tied embeddings: reuse token embedding weight.
+	embCtx := ctx.In("embeddings")
+	embVar := embCtx.GetVariableByScopeAndName(embCtx.Scope(), "embeddings")
+	if embVar == nil {
+		panic("llama: neither lm_head nor embeddings weights found")
+	}
+	embWeights := embVar.ValueGraph(g)
+	batchSize := hidden.Shape().Dimensions[0]
+	seqLen := hidden.Shape().Dimensions[1]
+
+	if qt, ok := b.quantInfo["embeddings/embeddings"]; ok {
+		quant := &Quantization{
+			Scheme:   backends.QuantGGML,
+			GGMLType: qt,
+		}
+		return nn.QuantizedDense(hidden, embWeights, quant, nil)
+	}
+
+	if embWeights.DType() != hidden.DType() {
+		embWeights = ConvertDType(embWeights, hidden.DType())
+	}
+	vocabSize := embVar.Shape().Dimensions[0]
+	hiddenFlat := Reshape(hidden, batchSize*seqLen, b.config.HiddenSize)
+	logits := Einsum("bh,vh->bv", hiddenFlat, embWeights)
+	return Reshape(logits, batchSize, seqLen, vocabSize)
 }
+
+// LlamaConfig returns the Llama-specific configuration.
+func (b *Builder) LlamaConfig() *Config {
+	return b.config
+}
+

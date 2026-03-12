@@ -99,6 +99,7 @@ func (c *Config) RopeScaling(layerIdx int) float64 {
 type Builder struct {
 	config       *Config
 	visionConfig *VisionConfig // nil for text-only models
+	imageTokenID int32         // token ID for <image> placeholder (from tokenizer)
 	isGGUF       bool
 	quantInfo    models.QuantInfo // scope path → GGML quant type for quantized weights
 }
@@ -189,6 +190,9 @@ func (b *Builder) parseVisionConfig(base *models.BaseConfig) {
 			vc.LayerNormEps = 1e-6
 		}
 		b.visionConfig = vc
+		if v, ok := base.GetInt("image_token_id"); ok {
+			b.imageTokenID = int32(v)
+		}
 	}
 }
 
