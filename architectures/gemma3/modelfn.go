@@ -30,6 +30,11 @@ func (b *Builder) BuildModelFn() decode.ModelFn {
 
 		hidden := b.BuildEmbeddings(ctx, tokens)
 
+		// Merge image features into embeddings during prefill.
+		if aux != nil && aux.ImageFeatures != nil && seqLen > 1 {
+			hidden = b.mergeImageFeatures(hidden, aux.ImageFeatures, tokens)
+		}
+
 		// Build position IDs [batch, seqLen] for RoPE.
 		// positions is [batch] int32 (per-element start position).
 		posI64 := ConvertDType(positions, dtypes.Int64)
@@ -53,6 +58,61 @@ func (b *Builder) BuildModelFn() decode.ModelFn {
 	}
 }
 
+// mergeImageFeatures replaces embeddings at image token positions with projected vision features.
+// hidden: [batch, seqLen, hiddenSize], imageFeatures: [batch, numPatches, hiddenSize],
+// tokens: [batch, seqLen] int32.
+//
+// Image tokens may not start at position 0 (e.g., they follow a chat template header).
+// We use CumSum on the image mask to build a proper index into imageFeatures so that
+// the 1st image token gets feature 0, the 2nd gets feature 1, etc.
+func (b *Builder) mergeImageFeatures(hidden, imageFeatures, tokens *Node) *Node {
+	g := hidden.Graph()
+	batchSize := hidden.Shape().Dimensions[0]
+	seqLen := hidden.Shape().Dimensions[1]
+	hiddenSize := hidden.Shape().Dimensions[2]
+
+	// Create a boolean mask: true where token == imageTokenID.
+	imageTokenConst := Scalar(g, dtypes.Int32, int32(262144))
+	isImage := Equal(tokens, imageTokenConst) // [batch, seqLen] bool
+
+	// Build per-position indices into imageFeatures using CumSum.
+	// CumSum uses SumPool internally which requires float types.
+	// isImageF32: [batch, seqLen] with 1.0 at image positions, 0.0 elsewhere.
+	// CumSum gives running count: 0, 0, ..., 1, 2, 3, ..., 4096, 4096, ...
+	// Subtract 1 for 0-based indexing, clamp to [0, numPatches-1].
+	isImageF32 := ConvertDType(isImage, dtypes.Float32)
+	cumIdx := CumSum(isImageF32, 1)                              // [batch, seqLen] float32
+	cumIdx = ConvertDType(cumIdx, dtypes.Int32)                  // back to int for indexing
+	featureIdx := Sub(cumIdx, Scalar(g, dtypes.Int32, int32(1))) // 0-based
+	numPatches := imageFeatures.Shape().Dimensions[1]
+	featureIdx = MinScalar(MaxScalar(featureIdx, 0), int32(numPatches-1)) // clamp
+
+	// Convert imageFeatures dtype to match hidden if needed.
+	if imageFeatures.DType() != hidden.DType() {
+		imageFeatures = ConvertDType(imageFeatures, hidden.DType())
+	}
+
+	// Gather: for each sequence position, fetch the corresponding image feature.
+	// featureIdx: [batch, seqLen] → gathered: [batch, seqLen, hiddenSize]
+	// We expand featureIdx to [batch, seqLen, 1] and use it to index axis 1 of imageFeatures.
+	featureIdx3D := InsertAxes(featureIdx, -1) // [batch, seqLen, 1]
+	featureIdx3D = BroadcastToDims(featureIdx3D, batchSize, seqLen, hiddenSize) // [batch, seqLen, hiddenSize]
+
+	// Use Gather along axis 1: for each batch element, gather from [numPatches, hiddenSize].
+	// Since GoMLX doesn't have a simple batched gather-by-index, we use OnehostAndDot approach:
+	// Build one-hot [batch, seqLen, numPatches] from featureIdx, then matmul with imageFeatures.
+	featureIdxFlat := Reshape(featureIdx, batchSize*seqLen)
+	oneHot := OneHot(featureIdxFlat, numPatches, dtypes.Float32) // [batch*seqLen, numPatches]
+	oneHot = Reshape(oneHot, batchSize, seqLen, numPatches)               // [batch, seqLen, numPatches]
+	// Matmul: [batch, seqLen, numPatches] @ [batch, numPatches, hiddenSize] = [batch, seqLen, hiddenSize]
+	gathered := Einsum("bsp,bph->bsh", oneHot, imageFeatures)
+
+	// Expand mask and select: image positions get gathered features, others keep hidden.
+	isImage3D := InsertAxes(isImage, -1) // [batch, seqLen, 1]
+	isImage3D = BroadcastToDims(isImage3D, batchSize, seqLen, hiddenSize)
+	return Where(isImage3D, gathered, hidden)
+}
+
 // decoderLayerWithKV runs a single decoder layer using KVCacheAccessor.
 func (b *Builder) decoderLayerWithKV(ctx *context.Context, hidden, positionIDs *Node, kv attention.KVCacheAccessor, aux *decode.AuxInputs, layerIdx, seqLen int) *Node {
 	cfg := b.config
@@ -70,7 +130,10 @@ func (b *Builder) decoderLayerWithKV(ctx *context.Context, hidden, positionIDs *
 	return hidden
 }
 
-// attentionWithKV runs self-attention using KVCacheAccessor for KV storage.
+// attentionWithKV runs self-attention using KVCacheAccessor for KV storage
+// and attention.Core for the scaled dot-product attention computation.
+// attention.Core automatically uses the fused SDPA backend op when available,
+// falling back to decomposed Einsum+Softmax otherwise.
 func (b *Builder) attentionWithKV(ctx *context.Context, hidden, positionIDs *Node, kv attention.KVCacheAccessor, aux *decode.AuxInputs, layerIdx, seqLen int) *Node {
 	cfg := b.config
 	attnCtx := ctx.In("attention")
@@ -79,7 +142,6 @@ func (b *Builder) attentionWithKV(ctx *context.Context, hidden, positionIDs *Nod
 	batchSize := hidden.Shape().Dimensions[0]
 	headDim := cfg.HeadDim
 	kvHeads := cfg.KVHeads()
-	headsPerGroup := cfg.HeadsPerKVGroup()
 
 	// Q, K, V projections.
 	query := b.denseOrQuantized(attnCtx.In("query"), hidden)
@@ -100,83 +162,78 @@ func (b *Builder) attentionWithKV(ctx *context.Context, hidden, positionIDs *Nod
 	query = common.RMSNorm(attnCtx.In("q_norm"), query, cfg.RMSNormEps)
 	key = common.RMSNorm(attnCtx.In("k_norm"), key, cfg.RMSNormEps)
 
-	// RoPE — use per-layer theta (local=10K, global=1M).
+	// RoPE — use per-layer theta (local=10K, global=1M) and scaling.
 	ropeTheta := cfg.RopeFreqBase(layerIdx)
-	query, key = common.RoPE(query, key, positionIDs, ropeTheta, seqLen, headDim)
+	ropeScale := cfg.RopeScaling(layerIdx)
+	query, key = common.RoPE(query, key, positionIDs, ropeTheta, seqLen, headDim, ropeScale)
 
 	// Store K/V in cache and retrieve full cached K/V.
 	// newKey/newValue: [batch, kvHeads, seqLen, headDim]
 	// cachedKey/cachedValue: [batch, kvHeads, maxSeqLen, headDim]
 	cachedKey, cachedValue := kv.WriteRead(attnCtx, g, key, value)
 
-	// Expand KV heads for GQA.
-	if headsPerGroup > 1 {
-		cachedKey = common.RepeatKV(cachedKey, headsPerGroup)
-		cachedValue = common.RepeatKV(cachedValue, headsPerGroup)
-	}
-
-	// Attention scores: [batch, heads, seqLen, keySeqLen].
+	// Build boolean attention mask and call attention.Core.
+	// attention.Core handles GQA internally via Q-reshape (no RepeatKV needed)
+	// and tries the fused SDPA backend op, falling back to decomposed ops.
 	keySeqLen := kv.KeySeqLen()
-	scores := Einsum("bhqd,bhkd->bhqk", query, cachedKey)
-	scale := ConstAs(scores, 1.0/math.Sqrt(float64(headDim)))
-	scores = Mul(scores, scale)
+	scale := 1.0 / math.Sqrt(float64(headDim))
+	mask := b.buildBooleanMask(g, kv, aux, batchSize, seqLen, keySeqLen, layerIdx)
 
-	// Apply mask.
-	if seqLen > 1 {
-		// Prefill: use causal mask (or sliding window causal mask).
-		// The KV cache mask isn't useful here since we're writing all positions.
-		if cfg.IsLocalAttentionLayer(layerIdx) && cfg.SlidingWindow > 0 {
-			causalMask := common.CreateSlidingWindowCausalMask(g, seqLen, cfg.SlidingWindow, scores.DType())
-			// Pad to keySeqLen (maxSeqLen) — positions beyond seqLen are zero in cache.
-			if keySeqLen > seqLen {
-				padWidth := keySeqLen - seqLen
-				negInfPad := MulScalar(Ones(g, shapes.Make(scores.DType(), 1, 1, seqLen, padWidth)), -1e9)
-				causalMask = Concatenate([]*Node{causalMask, negInfPad}, 3)
-			}
-			scores = Add(scores, causalMask)
-		} else {
-			causalMask := common.CreateCausalMask(g, seqLen, scores.DType())
-			if keySeqLen > seqLen {
-				padWidth := keySeqLen - seqLen
-				negInfPad := MulScalar(Ones(g, shapes.Make(scores.DType(), 1, 1, seqLen, padWidth)), -1e9)
-				causalMask = Concatenate([]*Node{causalMask, negInfPad}, 3)
-			}
-			scores = Add(scores, causalMask)
-		}
-	} else {
-		// Decode: use accessor's mask (valid cache positions).
-		baseMask := kv.Mask(g, seqLen) // [batch, 1, 1, keySeqLen] bool
-
-		if cfg.IsLocalAttentionLayer(layerIdx) && cfg.SlidingWindow > 0 {
-			// Also apply sliding window: only attend to [pos-window, pos].
-			// Use cacheWritePositions if available (post-compaction), else positions.
-			maskPos := aux.CacheWritePositions
-			if maskPos == nil {
-				maskPos = kv.(*attention.FlatKVCacheAccessor).Positions
-			}
-			posI32 := ConvertDType(maskPos, dtypes.Int32)
-			windowStart := Max(SubScalar(posI32, int32(cfg.SlidingWindow)), Const(g, int32(0)))
-			windowStart = Reshape(windowStart, batchSize, 1) // [batch, 1]
-
-			keyPositions := Iota(g, shapes.Make(dtypes.Int32, keySeqLen), 0)          // [keySeqLen]
-			keyPositions = Reshape(keyPositions, 1, keySeqLen)                         // [1, keySeqLen]
-			windowMask := GreaterOrEqual(keyPositions, windowStart)                    // [batch, keySeqLen]
-			windowMask = Reshape(windowMask, batchSize, 1, 1, keySeqLen)               // [batch, 1, 1, keySeqLen]
-
-			baseMask = And(baseMask, windowMask)
-		}
-
-		// Convert boolean mask to additive float mask.
-		floatMask := Where(baseMask, ZerosLike(scores), MulScalar(OnesLike(scores), -1e9))
-		scores = Add(scores, floatMask)
-	}
-
-	attnWeights := Softmax(scores, -1)
-	attnOutput := Einsum("bhqk,bhkd->bhqd", attnWeights, cachedValue)
+	output, _ := attention.Core(nil, query, cachedKey, cachedValue, scale, mask, 0, attention.LayoutBHSD, false, false)
 
 	// Reshape: [batch, heads, seq, headDim] -> [batch, seq, heads*headDim]
-	attnOutput = Transpose(attnOutput, 1, 2)
-	attnOutput = Reshape(attnOutput, batchSize, seqLen, cfg.NumAttentionHeads*headDim)
+	output = Transpose(output, 1, 2)
+	output = Reshape(output, batchSize, seqLen, cfg.NumAttentionHeads*headDim)
 
-	return b.denseOrQuantized(attnCtx.In("output"), attnOutput)
+	return b.denseOrQuantized(attnCtx.In("output"), output)
+}
+
+// buildBooleanMask builds a boolean attention mask combining the KV cache
+// validity mask with causal masking and optional sliding window constraints.
+// Returns a mask shaped [batch, 1, seqLen, keySeqLen] where true = attend.
+func (b *Builder) buildBooleanMask(g *Graph, kv attention.KVCacheAccessor, aux *decode.AuxInputs, batchSize, seqLen, keySeqLen, layerIdx int) *Node {
+	cfg := b.config
+
+	if seqLen > 1 {
+		// Prefill: use full causal mask for ALL layers.
+		// Sliding window is only enforced during decode — during prefill, all
+		// positions are processed simultaneously so local layers can safely
+		// attend to the full causal context. The sliding window constraint
+		// is restored during autoregressive decode via the KV cache mask.
+		var causalMask *Node
+		causalMask = LowerTriangular(g, seqLen)
+		// Reshape to [1, 1, seqLen, seqLen] for broadcasting.
+		causalMask = Reshape(causalMask, 1, 1, seqLen, seqLen)
+
+		// Pad to keySeqLen — positions beyond seqLen are masked out.
+		if keySeqLen > seqLen {
+			padWidth := keySeqLen - seqLen
+			falsePad := BroadcastPrefix(Const(g, false), 1, 1, seqLen, padWidth)
+			causalMask = Concatenate([]*Node{causalMask, falsePad}, 3)
+		}
+		return causalMask
+	}
+
+	// Decode: use the KV cache accessor's validity mask.
+	baseMask := kv.Mask(g, seqLen) // [batch, 1, 1, keySeqLen] bool
+
+	if cfg.IsLocalAttentionLayer(layerIdx) && cfg.SlidingWindow > 0 {
+		// Apply sliding window: only attend to [pos-window, pos].
+		maskPos := aux.CacheWritePositions
+		if maskPos == nil {
+			maskPos = kv.(*attention.FlatKVCacheAccessor).Positions
+		}
+		posI32 := ConvertDType(maskPos, dtypes.Int32)
+		windowStart := Max(SubScalar(posI32, int32(cfg.SlidingWindow)), Const(g, int32(0)))
+		windowStart = Reshape(windowStart, batchSize, 1) // [batch, 1]
+
+		keyPositions := Iota(g, shapes.Make(dtypes.Int32, keySeqLen), 0) // [keySeqLen]
+		keyPositions = Reshape(keyPositions, 1, keySeqLen)               // [1, keySeqLen]
+		windowMask := GreaterOrEqual(keyPositions, windowStart)          // [batch, keySeqLen]
+		windowMask = Reshape(windowMask, batchSize, 1, 1, keySeqLen)    // [batch, 1, 1, keySeqLen]
+
+		baseMask = And(baseMask, windowMask)
+	}
+
+	return baseMask
 }

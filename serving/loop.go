@@ -455,14 +455,19 @@ func (e *Engine) prefillRequestBatched(req *engineRequest) error {
 		hasAux := req.auxData != nil && req.auxData.ImageFeatures != nil
 		if hasAux {
 			if e.pagedMode {
-				e.finishRequest(req, fmt.Errorf("multimodal inputs not yet supported with paged KV cache"))
-				return nil
+				if err := e.initPagedMultimodalPromptExec(); err != nil {
+					e.finishRequest(req, fmt.Errorf("init paged multimodal prompt exec: %w", err))
+					return nil
+				}
+				pt := e.buildPrefillPageTableTensor(req)
+				outputs, err = e.pagedMultimodalExec.Exec(prompt, positions, pt, req.auxData.ImageFeatures)
+			} else {
+				if err := e.initMultimodalPromptExec(); err != nil {
+					e.finishRequest(req, fmt.Errorf("init multimodal prompt exec: %w", err))
+					return nil
+				}
+				outputs, err = e.batchedMultimodalExec.Exec(prompt, positions, req.auxData.ImageFeatures)
 			}
-			if err := e.initMultimodalPromptExec(); err != nil {
-				e.finishRequest(req, fmt.Errorf("init multimodal prompt exec: %w", err))
-				return nil
-			}
-			outputs, err = e.batchedMultimodalExec.Exec(prompt, positions, req.auxData.ImageFeatures)
 		} else if e.pagedMode {
 			if err := e.initPagedPromptExec(); err != nil {
 				e.finishRequest(req, fmt.Errorf("init paged prompt exec: %w", err))

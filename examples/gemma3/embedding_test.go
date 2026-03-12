@@ -12,6 +12,7 @@ import (
 	. "github.com/gomlx/gomlx/pkg/core/graph"
 	"github.com/gomlx/gomlx/pkg/core/tensors"
 	"github.com/gomlx/gomlx/pkg/ml/context"
+	"github.com/gomlx/gomlx/pkg/ml/nn"
 
 	"github.com/gomlx/go-huggingface/models/gguf"
 
@@ -173,7 +174,7 @@ func TestQuantizedEmbeddingAccuracy(t *testing.T) {
 }
 
 // TestSmallTableGather creates a small Q6_K table from specific rows of the GGUF
-// embedding table and tests FusedQuantizedGather directly. This isolates whether
+// embedding table and tests BackendFusedQuantizedGather directly. This isolates whether
 // the issue is in the dequant function or the large buffer handling.
 func TestSmallTableGather(t *testing.T) {
 	ggufPath := getGGUFPath()
@@ -223,18 +224,18 @@ func TestSmallTableGather(t *testing.T) {
 
 	backend := backends.MustNew()
 
-	// Run FusedQuantizedGather for each row in the small table.
+	// Run BackendFusedQuantizedGather for each row in the small table.
 	for localIdx, srcRow := range sourceRows {
 		t.Run(fmt.Sprintf("row_%d", srcRow), func(t *testing.T) {
 			tableTensor := tensors.FromFlatDataAndDimensions(smallTable, numRows, bytesPerRow)
 			indexTensor := tensors.FromFlatDataAndDimensions([]int32{int32(localIdx)}, 1, 1)
 
 			exec, err := context.NewExec(backend, context.New(), func(ctx *context.Context, table, indices *Node) *Node {
-				quant := &backends.Quantization{
+				quant := &Quantization{
 					Scheme:   backends.QuantGGML,
 					GGMLType: backends.GGMLQ6_K,
 				}
-				return FusedQuantizedGather(table, indices, quant)
+				return nn.QuantizedGather(table, indices, quant)
 			})
 			if err != nil {
 				t.Fatalf("NewExec: %v", err)

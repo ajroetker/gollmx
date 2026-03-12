@@ -27,6 +27,33 @@ func Embedding(ctx *context.Context, inputIDs *graph.Node, vocabSize, hiddenSize
 	return embeddings
 }
 
+// EmbeddingFromVar performs an embedding lookup using an already-loaded variable.
+// The result is converted to Float32 for downstream computation.
+func EmbeddingFromVar(ctx *context.Context, inputIDs *graph.Node, v *context.Variable) *graph.Node {
+	g := inputIDs.Graph()
+	table := v.ValueGraph(g)
+
+	// Prepare indices with trailing dim of 1 for Gather.
+	indices := inputIDs
+	inputShape := inputIDs.Shape()
+	if inputShape.IsScalar() || inputShape.Dimensions[inputShape.Rank()-1] != 1 {
+		indices = graph.InsertAxes(indices, -1)
+	}
+	embeddings := graph.Gather(table, indices)
+
+	// Convert to Float32 if needed (e.g. Float16 from GGUF).
+	if embeddings.DType() != dtypes.Float32 {
+		embeddings = graph.ConvertDType(embeddings, dtypes.Float32)
+	}
+
+	// Ensure 3D output: [batch, seq, hidden].
+	if embeddings.Shape().Rank() == 2 {
+		embeddings = graph.InsertAxes(embeddings, 1)
+	}
+
+	return embeddings
+}
+
 // QuantizedEmbedding performs a quantized embedding lookup using GGML-format weights.
 // Expects "embeddings" variable in scope as [vocabSize, bytesPerRow] Uint8.
 // Dequantizes only the selected rows on-the-fly (like llama.cpp's ggml_get_rows).
@@ -112,14 +139,23 @@ func BuildRelativePositionEmbeddings(g *graph.Graph, relEmbeddings *graph.Node, 
 // RoPE applies Rotary Position Embedding to query and key tensors.
 // query/key shape: [batch, heads, seq, head_dim]
 // positionIDs shape: [batch, seq] or nil (will use sequential positions)
-func RoPE(query, key *graph.Node, positionIDs *graph.Node, theta float64, seqLen, headDim int) (*graph.Node, *graph.Node) {
+// scalingFactor: for linear RoPE scaling, frequencies are divided by this factor.
+// Use 1.0 or 0.0 for no scaling.
+func RoPE(query, key *graph.Node, positionIDs *graph.Node, theta float64, seqLen, headDim int, scalingFactor ...float64) (*graph.Node, *graph.Node) {
 	g := query.Graph()
 
+	// Apply linear RoPE scaling: divide frequencies by the factor.
+	// This stretches position encodings to support longer contexts.
+	factor := 1.0
+	if len(scalingFactor) > 0 && scalingFactor[0] > 1.0 {
+		factor = scalingFactor[0]
+	}
+
 	// Compute rotary frequencies.
-	// freq_i = theta^(-2i/d) for i in [0, d/2)
+	// freq_i = theta^(-2i/d) / factor for i in [0, d/2)
 	invFreq := make([]float32, headDim/2)
 	for i := 0; i < headDim/2; i++ {
-		invFreq[i] = float32(1.0 / math.Pow(theta, float64(2*i)/float64(headDim)))
+		invFreq[i] = float32(1.0 / (math.Pow(theta, float64(2*i)/float64(headDim)) * factor))
 	}
 	invFreqNode := graph.Const(g, invFreq)
 	invFreqNode = graph.Reshape(invFreqNode, 1, 1, headDim/2) // [1, 1, head_dim/2]

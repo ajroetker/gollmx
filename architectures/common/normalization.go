@@ -57,6 +57,11 @@ func ApplyRMSNormWithParams(x, weight *Node, epsilon float64) *Node {
 	rms := Sqrt(Add(variance, eps))
 	normalized := Div(x, rms)
 
+	// Convert weight dtype to match x if needed (e.g. Float16 weights with Float32 input).
+	if weight.DType() != x.DType() {
+		weight = ConvertDType(weight, x.DType())
+	}
+
 	// Reshape weight to broadcast with x.
 	xRank := x.Shape().Rank()
 	broadcastShape := make([]int, xRank)

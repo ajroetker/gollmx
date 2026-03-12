@@ -231,11 +231,40 @@ func ParseConfigFromGGUF(f *gguf.File) (*BaseConfig, error) {
 	if v, ok := getFloat(arch + ".rope.freq_base"); ok {
 		config.Raw["rope_theta"] = v
 	}
+	if v, ok := getFloat(arch + ".rope.scaling.factor"); ok {
+		config.Raw["rope_scaling.factor"] = v
+	}
 	if v, ok := getInt(arch + ".attention.sliding_window"); ok {
 		config.Raw["sliding_window"] = float64(v)
 	}
 	if v, ok := getFloat(arch + ".attention.layer_norm_rms_epsilon"); ok {
 		config.Raw["rms_norm_eps"] = v
+	}
+
+	// Vision encoder metadata (e.g., SigLIP for Gemma 3 multimodal).
+	if v, ok := getInt(arch + ".vision.block_count"); ok {
+		config.Raw["vision.block_count"] = float64(v)
+	}
+	if v, ok := getInt(arch + ".vision.embedding_length"); ok {
+		config.Raw["vision.embedding_length"] = float64(v)
+	}
+	if v, ok := getInt(arch + ".vision.attention.head_count"); ok {
+		config.Raw["vision.attention.head_count"] = float64(v)
+	}
+	if v, ok := getInt(arch + ".vision.feed_forward_length"); ok {
+		config.Raw["vision.feed_forward_length"] = float64(v)
+	}
+	if v, ok := getInt(arch + ".vision.image_size"); ok {
+		config.Raw["vision.image_size"] = float64(v)
+	}
+	if v, ok := getInt(arch + ".vision.patch_size"); ok {
+		config.Raw["vision.patch_size"] = float64(v)
+	}
+	if v, ok := getInt(arch + ".vision.num_channels"); ok {
+		config.Raw["vision.num_channels"] = float64(v)
+	}
+	if v, ok := getFloat(arch + ".vision.attention.layer_norm_epsilon"); ok {
+		config.Raw["vision.attention.layer_norm_epsilon"] = v
 	}
 
 	return config, nil

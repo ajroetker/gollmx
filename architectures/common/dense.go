@@ -67,7 +67,12 @@ func DenseWeightOnly(ctx *context.Context, x *Node) *Node {
 
 // ApplyDenseWeightOnly applies a weight-only dense layer.
 // weights shape: [out_features, in_features] (PyTorch convention)
+// If the weight dtype differs from x (e.g. Float16 weights with Float32 input),
+// the weights are converted to match x.
 func ApplyDenseWeightOnly(x, weights *Node) *Node {
+	if weights.DType() != x.DType() {
+		weights = ConvertDType(weights, x.DType())
+	}
 	// nn.Dense expects [in_features, out_features], transpose from PyTorch convention.
 	wT := Transpose(weights, 0, 1)
 	return nn.Dense(x, wT, nil)

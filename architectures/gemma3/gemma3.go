@@ -25,6 +25,7 @@ import (
 	"github.com/gomlx/gomlx/pkg/core/shapes"
 	"github.com/gomlx/gomlx/pkg/ml/context"
 	"github.com/gomlx/gomlx/pkg/ml/layers/activations"
+	"github.com/gomlx/gomlx/pkg/ml/layers/attention"
 	"github.com/gomlx/gomlx/pkg/ml/nn"
 
 	models "github.com/ajroetker/gollmx"
@@ -45,8 +46,9 @@ type Config struct {
 	SlidingWindow int `json:"sliding_window"` // Window size for local attention layers
 
 	// RoPE.
-	RopeTheta      float64 `json:"rope_theta"`       // Base frequency for global attention layers (default 1e6)
-	RopeLocalTheta float64 `json:"rope_local_theta"`  // Base frequency for local (SWA) attention layers (default 1e4)
+	RopeTheta         float64 `json:"rope_theta"`          // Base frequency for global attention layers (default 1e6)
+	RopeLocalTheta    float64 `json:"rope_local_theta"`    // Base frequency for local (SWA) attention layers (default 1e4)
+	RopeScalingFactor float64 `json:"rope_scaling_factor"` // Linear RoPE scaling factor (0 or 1 = no scaling)
 
 	// Normalization.
 	RMSNormEps float64 `json:"rms_norm_eps"`
@@ -72,7 +74,11 @@ func (c *Config) IsLocalAttentionLayer(layerIdx int) bool {
 	return layerIdx%6 != 5
 }
 
-// RopeTheta returns the RoPE base frequency for the given layer index.
+// RopeFreqBase returns the RoPE base frequency for the given layer index.
+// For global layers with linear RoPE scaling, the frequencies are divided
+// by the scaling factor. This is equivalent to multiplying the base theta
+// by the factor, which stretches the position encoding to support longer
+// sequences (e.g., factor=8 extends 8K context to ~64K+).
 func (c *Config) RopeFreqBase(layerIdx int) float64 {
 	if c.IsLocalAttentionLayer(layerIdx) {
 		return c.RopeLocalTheta
@@ -80,11 +86,21 @@ func (c *Config) RopeFreqBase(layerIdx int) float64 {
 	return c.RopeTheta
 }
 
+// RopeScaling returns the RoPE scaling factor for the given layer index.
+// Returns 1.0 (no scaling) for local attention layers or when scaling is disabled.
+func (c *Config) RopeScaling(layerIdx int) float64 {
+	if c.IsLocalAttentionLayer(layerIdx) || c.RopeScalingFactor <= 1.0 {
+		return 1.0
+	}
+	return c.RopeScalingFactor
+}
+
 // Builder implements the Gemma 3 architecture.
 type Builder struct {
-	config    *Config
-	isGGUF    bool
-	quantInfo models.QuantInfo // scope path → GGML quant type for quantized weights
+	config       *Config
+	visionConfig *VisionConfig // nil for text-only models
+	isGGUF       bool
+	quantInfo    models.QuantInfo // scope path → GGML quant type for quantized weights
 }
 
 // Name returns the architecture name.
@@ -126,13 +142,54 @@ func (b *Builder) ParseConfig(base *models.BaseConfig) error {
 		b.config.RopeLocalTheta = 1e4
 	}
 
+	if v, ok := base.GetFloat("rope_scaling.factor"); ok {
+		b.config.RopeScalingFactor = v
+	}
+
 	if v, ok := base.GetFloat("rms_norm_eps"); ok {
 		b.config.RMSNormEps = v
 	} else {
 		b.config.RMSNormEps = 1e-6
 	}
 
+	// Parse vision config if present (multimodal model).
+	b.parseVisionConfig(base)
+
 	return nil
+}
+
+// parseVisionConfig extracts vision encoder configuration if available.
+func (b *Builder) parseVisionConfig(base *models.BaseConfig) {
+	// Check for GGUF-style vision metadata.
+	if v, ok := base.GetInt("vision.block_count"); ok {
+		vc := &VisionConfig{NumLayers: v}
+		if v, ok := base.GetInt("vision.embedding_length"); ok {
+			vc.HiddenSize = v
+		}
+		if v, ok := base.GetInt("vision.attention.head_count"); ok {
+			vc.NumHeads = v
+		}
+		if v, ok := base.GetInt("vision.feed_forward_length"); ok {
+			vc.MLPDim = v
+		}
+		if v, ok := base.GetInt("vision.image_size"); ok {
+			vc.ImageSize = v
+		}
+		if v, ok := base.GetInt("vision.patch_size"); ok {
+			vc.PatchSize = v
+		}
+		if v, ok := base.GetInt("vision.num_channels"); ok {
+			vc.NumChannels = v
+		} else {
+			vc.NumChannels = 3
+		}
+		if v, ok := base.GetFloat("vision.attention.layer_norm_epsilon"); ok {
+			vc.LayerNormEps = v
+		} else {
+			vc.LayerNormEps = 1e-6
+		}
+		b.visionConfig = vc
+	}
 }
 
 // Config returns the base configuration.
@@ -151,7 +208,9 @@ func (b *Builder) LoadWeights(ctx *context.Context, weights models.WeightSource)
 	} else {
 		mapping = b.hfWeightMapping()
 	}
-	quantInfo, err := models.LoadWeightsFromMapping(weights, mapping, ctx)
+	quantInfo, err := models.LoadWeightsFromMapping(weights, mapping, ctx, models.LoadWeightsOptions{
+		ComputeDType: dtypes.Float32,
+	})
 	if err != nil {
 		return err
 	}
@@ -221,6 +280,54 @@ func (b *Builder) ggufWeightMapping() map[string]string {
 	// LM head (may be absent if tied to embeddings).
 	mapping["output.weight"] = "lm_head/weights"
 
+	// Vision encoder weights (SigLIP).
+	if b.visionConfig != nil {
+		vc := b.visionConfig
+
+		// Patch embedding.
+		mapping["v.patch_embedding.weight"] = "vision/patch_embedding/weights"
+		mapping["v.patch_embedding.bias"] = "vision/patch_embedding/biases"
+
+		// Position embedding.
+		mapping["v.position_embedding.weight"] = "vision/position_embeddings"
+
+		// Encoder layers.
+		for i := range vc.NumLayers {
+			src := fmt.Sprintf("v.blk.%d", i)
+			dst := fmt.Sprintf("vision/layers/%d", i)
+
+			// LayerNorms (with gain/bias for common.LayerNorm).
+			mapping[src+".layer_norm1.weight"] = dst + "/layer_norm1/gain"
+			mapping[src+".layer_norm1.bias"] = dst + "/layer_norm1/offset"
+			mapping[src+".layer_norm2.weight"] = dst + "/layer_norm2/gain"
+			mapping[src+".layer_norm2.bias"] = dst + "/layer_norm2/offset"
+
+			// Attention (with bias).
+			mapping[src+".attn_q.weight"] = dst + "/attn_q/weights"
+			mapping[src+".attn_q.bias"] = dst + "/attn_q/biases"
+			mapping[src+".attn_k.weight"] = dst + "/attn_k/weights"
+			mapping[src+".attn_k.bias"] = dst + "/attn_k/biases"
+			mapping[src+".attn_v.weight"] = dst + "/attn_v/weights"
+			mapping[src+".attn_v.bias"] = dst + "/attn_v/biases"
+			mapping[src+".attn_output.weight"] = dst + "/attn_output/weights"
+			mapping[src+".attn_output.bias"] = dst + "/attn_output/biases"
+
+			// MLP.
+			mapping[src+".mlp.fc1.weight"] = dst + "/mlp/fc1/weights"
+			mapping[src+".mlp.fc1.bias"] = dst + "/mlp/fc1/biases"
+			mapping[src+".mlp.fc2.weight"] = dst + "/mlp/fc2/weights"
+			mapping[src+".mlp.fc2.bias"] = dst + "/mlp/fc2/biases"
+		}
+
+		// Post-layer normalization.
+		mapping["v.post_layernorm.weight"] = "vision/post_layernorm/gain"
+		mapping["v.post_layernorm.bias"] = "vision/post_layernorm/offset"
+
+		// Multi-modal projector.
+		mapping["mm.mm_input_projection.weight"] = "mm/input_projection/weights"
+		mapping["mm.mm_soft_emb_norm.weight"] = "mm/soft_emb_norm/weight"
+	}
+
 	return mapping
 }
 
@@ -285,13 +392,13 @@ func (b *Builder) BuildEmbeddings(ctx *context.Context, inputIDs *Node) *Node {
 	if qt, ok := b.quantInfo["embeddings/embeddings"]; ok {
 		// Quantized path: dequantize only the selected rows on-the-fly.
 		embeddings = common.QuantizedEmbedding(embCtx, inputIDs, qt)
+	} else if v := embCtx.GetVariableByScopeAndName(embCtx.Scope(), "embeddings"); v != nil {
+		// Variable already loaded (e.g. from GGUF) — use it directly,
+		// preserving its dtype (which may be Float16, not Float32).
+		embeddings = common.EmbeddingFromVar(embCtx, inputIDs, v)
 	} else {
-		// Float path.
-		vocabSize := cfg.VocabSize
-		if v := embCtx.GetVariableByScopeAndName(embCtx.Scope(), "embeddings"); v != nil {
-			vocabSize = v.Shape().Dimensions[0]
-		}
-		embeddings = common.Embedding(embCtx, inputIDs, vocabSize, cfg.HiddenSize)
+		// Float path: create new variable.
+		embeddings = common.Embedding(embCtx, inputIDs, cfg.VocabSize, cfg.HiddenSize)
 	}
 
 	// Gemma 3 scales embeddings by sqrt(hidden_size).
@@ -538,7 +645,6 @@ func (b *Builder) buildAttentionPrefill(ctx *context.Context, hidden, positionID
 	seqLen := hidden.Shape().Dimensions[1]
 	headDim := cfg.HeadDim
 	kvHeads := cfg.KVHeads()
-	headsPerGroup := cfg.HeadsPerKVGroup()
 
 	query := b.denseOrQuantized(attnCtx.In("query"), hidden)
 	key := b.denseOrQuantized(attnCtx.In("key"), hidden)
@@ -557,32 +663,21 @@ func (b *Builder) buildAttentionPrefill(ctx *context.Context, hidden, positionID
 	key = common.RMSNorm(attnCtx.In("k_norm"), key, cfg.RMSNormEps)
 
 	ropeTheta := cfg.RopeFreqBase(layerIdx)
-	query, key = common.RoPE(query, key, positionIDs, ropeTheta, seqLen, headDim)
+	ropeScale := cfg.RopeScaling(layerIdx)
+	query, key = common.RoPE(query, key, positionIDs, ropeTheta, seqLen, headDim, ropeScale)
 
-	// Save K/V for cache (before GQA expansion).
+	// Save K/V for cache (before attention computation).
 	cachedKeys := key
 	cachedValues := value
 
-	if headsPerGroup > 1 {
-		key = common.RepeatKV(key, headsPerGroup)
-		value = common.RepeatKV(value, headsPerGroup)
-	}
-
-	scores := Einsum("bhqd,bhkd->bhqk", query, key)
-	scale := ConstAs(scores, 1.0/math.Sqrt(float64(headDim)))
-	scores = Mul(scores, scale)
-
-	g := hidden.Graph()
-	if cfg.IsLocalAttentionLayer(layerIdx) && cfg.SlidingWindow > 0 {
-		mask := common.CreateSlidingWindowCausalMask(g, seqLen, cfg.SlidingWindow, scores.DType())
-		scores = Add(scores, mask)
-	} else {
-		mask := common.CreateCausalMask(g, seqLen, scores.DType())
-		scores = Add(scores, mask)
-	}
-
-	attnWeights := Softmax(scores, -1)
-	attnOutput := Einsum("bhqk,bhkd->bhqd", attnWeights, value)
+	// Build causal mask and use attention.Core for scaled dot-product attention.
+	// attention.Core handles GQA internally via Q-reshape (no RepeatKV needed)
+	// and tries the fused SDPA backend op, falling back to decomposed ops.
+	//
+	// During prefill, all layers use full causal attention (no sliding window).
+	// The sliding window constraint is only enforced during autoregressive decode.
+	scale := 1.0 / math.Sqrt(float64(headDim))
+	attnOutput, _ := attention.Core(nil, query, key, value, scale, nil, 0, attention.LayoutBHSD, true, false)
 
 	attnOutput = Transpose(attnOutput, 1, 2)
 	attnOutput = Reshape(attnOutput, batchSize, seqLen, cfg.NumAttentionHeads*headDim)
@@ -605,7 +700,6 @@ func (b *Builder) buildAttentionDecode(ctx *context.Context, hidden, positionIDs
 	batchSize := hidden.Shape().Dimensions[0]
 	headDim := cfg.HeadDim
 	kvHeads := cfg.KVHeads()
-	headsPerGroup := cfg.HeadsPerKVGroup()
 	bufferLen := prevKeys.Shape().Dimensions[2]
 
 	// Q/K/V projections on single token.
@@ -627,9 +721,10 @@ func (b *Builder) buildAttentionDecode(ctx *context.Context, hidden, positionIDs
 	query = common.RMSNorm(attnCtx.In("q_norm"), query, cfg.RMSNormEps)
 	key = common.RMSNorm(attnCtx.In("k_norm"), key, cfg.RMSNormEps)
 
-	// RoPE with explicit position — use per-layer theta.
+	// RoPE with explicit position — use per-layer theta and scaling.
 	ropeTheta := cfg.RopeFreqBase(layerIdx)
-	query, key = common.RoPE(query, key, positionIDs, ropeTheta, 1, headDim)
+	ropeScale := cfg.RopeScaling(layerIdx)
+	query, key = common.RoPE(query, key, positionIDs, ropeTheta, 1, headDim, ropeScale)
 
 	// Insert new K/V into buffer at kvInsertPos.
 	updatedKeys := DynamicUpdateSlice(prevKeys, key, []*Node{
@@ -639,22 +734,10 @@ func (b *Builder) buildAttentionDecode(ctx *context.Context, hidden, positionIDs
 		Const(g, int32(0)), Const(g, int32(0)), kvInsertPos, Const(g, int32(0)),
 	})
 
-	// Build decode attention mask.
-	mask := b.buildDecodeMask(g, bufferLen, kvInsertPos, layerIdx, hidden.DType())
-
-	// Expand KV for GQA.
-	fullKeys := common.RepeatKV(updatedKeys, headsPerGroup)
-	fullValues := common.RepeatKV(updatedValues, headsPerGroup)
-
-	// Attention scores: [batch, heads, 1, bufferLen]
-	scores := Einsum("bhqd,bhkd->bhqk", query, fullKeys)
-	scale := ConstAs(scores, 1.0/math.Sqrt(float64(headDim)))
-	scores = Mul(scores, scale)
-
-	scores = Add(scores, mask)
-
-	attnWeights := Softmax(scores, -1)
-	attnOutput := Einsum("bhqk,bhkd->bhqd", attnWeights, fullValues)
+	// Build boolean decode mask and use attention.Core.
+	mask := b.buildDecodeBoolMask(g, bufferLen, kvInsertPos, layerIdx)
+	scale := 1.0 / math.Sqrt(float64(headDim))
+	attnOutput, _ := attention.Core(nil, query, updatedKeys, updatedValues, scale, mask, 0, attention.LayoutBHSD, false, false)
 
 	// Reshape: [batch, heads, 1, headDim] -> [batch, 1, heads*headDim]
 	attnOutput = Transpose(attnOutput, 1, 2)
@@ -665,10 +748,10 @@ func (b *Builder) buildAttentionDecode(ctx *context.Context, hidden, positionIDs
 	return attnOutput, updatedKeys, updatedValues
 }
 
-// buildDecodeMask builds an attention mask for the decode step.
-// Valid positions (< realLen) get 0; invalid positions get -1e9.
+// buildDecodeBoolMask builds a boolean attention mask for the decode step.
+// True = attend, False = mask out.
 // For local attention layers, positions outside the sliding window are also masked.
-func (b *Builder) buildDecodeMask(g *Graph, bufferLen int, kvInsertPos *Node, layerIdx int, dtype dtypes.DType) *Node {
+func (b *Builder) buildDecodeBoolMask(g *Graph, bufferLen int, kvInsertPos *Node, layerIdx int) *Node {
 	cfg := b.config
 
 	// positions = [0, 1, 2, ..., bufferLen-1]
@@ -677,14 +760,8 @@ func (b *Builder) buildDecodeMask(g *Graph, bufferLen int, kvInsertPos *Node, la
 	// realLen = kvInsertPos + 1 (the new token is at kvInsertPos).
 	realLen := AddScalar(kvInsertPos, int32(1))
 
-	// inRange: 1 where position < realLen, 0 otherwise.
-	inRange := Where(
-		LessThan(positions, realLen),
-		ConstAs(positions, int32(1)),
-		ConstAs(positions, int32(0)),
-	)
-
-	validMask := inRange
+	// Valid where position < realLen.
+	validMask := LessThan(positions, realLen)
 
 	if cfg.IsLocalAttentionLayer(layerIdx) && cfg.SlidingWindow > 0 {
 		// windowStart = max(realLen - slidingWindow, 0)
@@ -692,24 +769,12 @@ func (b *Builder) buildDecodeMask(g *Graph, bufferLen int, kvInsertPos *Node, la
 			SubScalar(realLen, int32(cfg.SlidingWindow)),
 			Const(g, int32(0)),
 		)
-		// inWindow: 1 where position >= windowStart, 0 otherwise.
-		// Equivalent to: NOT (position < windowStart).
-		inWindow := Where(
-			LessThan(positions, windowStart),
-			ConstAs(positions, int32(0)),
-			ConstAs(positions, int32(1)),
-		)
-		// Both conditions must hold.
-		validMask = Mul(validMask, inWindow)
+		// inWindow where position >= windowStart.
+		inWindow := GreaterOrEqual(positions, windowStart)
+		validMask = And(validMask, inWindow)
 	}
 
-	// Convert to float mask: 0 for valid, -1e9 for invalid.
-	maskFloat := ConvertDType(validMask, dtype)
-	one := ConstAs(maskFloat, 1.0)
-	negInf := ConstAs(maskFloat, -1e9)
-	mask := Mul(Sub(one, maskFloat), negInf)
-
-	return Reshape(mask, 1, 1, 1, bufferLen)
+	return Reshape(validMask, 1, 1, 1, bufferLen)
 }
 
 // applyLMHead applies the language model head (or tied embeddings).
@@ -744,6 +809,9 @@ func (b *Builder) ApplyLMHead(ctx *context.Context, hidden *Node, g *Graph) *Nod
 	}
 
 	// Float tied embeddings.
+	if embWeights.DType() != hidden.DType() {
+		embWeights = ConvertDType(embWeights, hidden.DType())
+	}
 	vocabSize := embVar.Shape().Dimensions[0]
 	hiddenFlat := Reshape(hidden, batchSize*seqLen, cfg.HiddenSize)
 	logits := Einsum("bh,vh->bv", hiddenFlat, embWeights)

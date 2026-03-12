@@ -162,6 +162,7 @@ type Engine struct {
 
 	// Cached executors — paged mode (separate from flat because they take page tables).
 	pagedPromptExec            *mlctx.Exec
+	pagedMultimodalExec        *mlctx.Exec             // paged prefill with aux inputs (images, etc.)
 	pagedDecodeExecCache       map[int]*mlctx.Exec     // paddedBatchSize → exec
 
 	// Eager embedding support.
@@ -507,7 +508,10 @@ func (e *Engine) initBatchedPromptExec() error {
 
 	cfg := e.unifiedKVConfig
 	var err error
-	e.batchedPromptExec, err = mlctx.NewExec(e.backend, e.modelCtx.Reuse(),
+	// Note: flat KV cache creates variables during graph construction, so we
+	// use Checked(false) to allow both creating new kv_cache variables and
+	// reusing existing weight variables.
+	e.batchedPromptExec, err = mlctx.NewExec(e.backend, e.modelCtx.Checked(false),
 		func(ctx *mlctx.Context, tokens *Node, positions *Node) *Node {
 			bs := tokens.Shape().Dimensions[0]
 			kv := attention.NewFlatKVCacheAccessor(bs, cfg.NumKVHeads, cfg.MaxSeqLen, cfg.HeadDim, cfg.DType, positions)
@@ -529,7 +533,10 @@ func (e *Engine) initMultimodalPromptExec() error {
 	}
 	cfg := e.unifiedKVConfig
 	var err error
-	e.batchedMultimodalExec, err = mlctx.NewExec(e.backend, e.modelCtx.Reuse(),
+	// Note: flat KV cache creates variables during graph construction, so we
+	// use Checked(false) to allow both creating new kv_cache variables and
+	// reusing existing weight variables.
+	e.batchedMultimodalExec, err = mlctx.NewExec(e.backend, e.modelCtx.Checked(false),
 		func(ctx *mlctx.Context, tokens *Node, positions *Node, imageFeatures *Node) *Node {
 			bs := tokens.Shape().Dimensions[0]
 			kv := attention.NewFlatKVCacheAccessor(bs, cfg.NumKVHeads, cfg.MaxSeqLen, cfg.HeadDim, cfg.DType, positions)
@@ -843,6 +850,35 @@ func (e *Engine) initPagedPromptExec() error {
 				ReadNumBlocks: maxBlocks,
 			}
 			logits := e.unifiedFn(ctx, tokens, positions, kv, nil)
+			lastLogits := Slice(logits, AxisRange(), AxisElem(-1), AxisRange())
+			lastLogits = Squeeze(lastLogits, 1)
+			return lastLogits
+		},
+	)
+	return err
+}
+
+// initPagedMultimodalPromptExec lazily initializes the paged multimodal prompt executor.
+// Takes [1, promptLen] tokens, [1] positions, [1, maxBlocksPerReq] page tables,
+// and [1, numPatches, hiddenDim] image features.
+// Returns [1, vocabSize] logits (last-token extracted).
+func (e *Engine) initPagedMultimodalPromptExec() error {
+	if e.pagedMultimodalExec != nil {
+		return nil
+	}
+	cfg := e.pagedCfg
+	maxBlocks := e.maxBlocksPerRequest()
+	var err error
+	e.pagedMultimodalExec, err = mlctx.NewExec(e.backend, e.modelCtx.Reuse().Checked(false),
+		func(ctx *mlctx.Context, tokens *Node, positions *Node, pageTables *Node, imageFeatures *Node) *Node {
+			kv := &kvcache.PagedKVCacheAccessor{
+				Config:        cfg,
+				PageTables:    pageTables,
+				Positions:     positions,
+				ReadNumBlocks: maxBlocks,
+			}
+			aux := &decode.AuxInputs{ImageFeatures: imageFeatures}
+			logits := e.unifiedFn(ctx, tokens, positions, kv, aux)
 			lastLogits := Slice(logits, AxisRange(), AxisElem(-1), AxisRange())
 			lastLogits = Squeeze(lastLogits, 1)
 			return lastLogits
