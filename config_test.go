@@ -6,13 +6,13 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/ajroetker/gollmx"
+	"github.com/gomlx/gollmx"
 
 	// Import architectures to register them for testing.
-	_ "github.com/ajroetker/gollmx/architectures/bert"
-	_ "github.com/ajroetker/gollmx/architectures/deberta"
-	_ "github.com/ajroetker/gollmx/architectures/gemma3"
-	_ "github.com/ajroetker/gollmx/architectures/llama"
+	_ "github.com/gomlx/gollmx/architectures/bert"
+	_ "github.com/gomlx/gollmx/architectures/deberta"
+	_ "github.com/gomlx/gollmx/architectures/gemma3"
+	_ "github.com/gomlx/gollmx/architectures/llama"
 )
 
 func TestParseConfigContent_BERT(t *testing.T) {

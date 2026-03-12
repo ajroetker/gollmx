@@ -11,7 +11,7 @@ import (
 	"github.com/gomlx/gomlx/pkg/ml/layers/attention"
 	"github.com/gomlx/gomlx/pkg/ml/nn"
 
-	"github.com/ajroetker/gollmx/architectures/common"
+	"github.com/gomlx/gollmx/architectures/common"
 )
 
 // VisionConfig holds SigLIP vision encoder configuration.

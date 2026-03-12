@@ -11,7 +11,7 @@ import (
 	"github.com/gomlx/gomlx/pkg/ml/decode"
 	"github.com/gomlx/gomlx/pkg/ml/layers/attention"
 
-	"github.com/ajroetker/gollmx/architectures/common"
+	"github.com/gomlx/gollmx/architectures/common"
 )
 
 // BuildModelFn returns a decode.ModelFn that uses KVCacheAccessor for
@@ -32,7 +32,7 @@ func (b *Builder) BuildModelFn() decode.ModelFn {
 
 		// Merge image features into embeddings during prefill.
 		if aux != nil && aux.ImageFeatures != nil && seqLen > 1 {
-			hidden = b.mergeImageFeatures(hidden, aux.ImageFeatures, tokens)
+			hidden = common.MergeImageFeatures(hidden, aux.ImageFeatures, tokens, gemma3ImageTokenID)
 		}
 
 		// Build position IDs [batch, seqLen] for RoPE.
@@ -58,60 +58,8 @@ func (b *Builder) BuildModelFn() decode.ModelFn {
 	}
 }
 
-// mergeImageFeatures replaces embeddings at image token positions with projected vision features.
-// hidden: [batch, seqLen, hiddenSize], imageFeatures: [batch, numPatches, hiddenSize],
-// tokens: [batch, seqLen] int32.
-//
-// Image tokens may not start at position 0 (e.g., they follow a chat template header).
-// We use CumSum on the image mask to build a proper index into imageFeatures so that
-// the 1st image token gets feature 0, the 2nd gets feature 1, etc.
-func (b *Builder) mergeImageFeatures(hidden, imageFeatures, tokens *Node) *Node {
-	g := hidden.Graph()
-	batchSize := hidden.Shape().Dimensions[0]
-	seqLen := hidden.Shape().Dimensions[1]
-	hiddenSize := hidden.Shape().Dimensions[2]
-
-	// Create a boolean mask: true where token == imageTokenID.
-	imageTokenConst := Scalar(g, dtypes.Int32, int32(262144))
-	isImage := Equal(tokens, imageTokenConst) // [batch, seqLen] bool
-
-	// Build per-position indices into imageFeatures using CumSum.
-	// CumSum uses SumPool internally which requires float types.
-	// isImageF32: [batch, seqLen] with 1.0 at image positions, 0.0 elsewhere.
-	// CumSum gives running count: 0, 0, ..., 1, 2, 3, ..., 4096, 4096, ...
-	// Subtract 1 for 0-based indexing, clamp to [0, numPatches-1].
-	isImageF32 := ConvertDType(isImage, dtypes.Float32)
-	cumIdx := CumSum(isImageF32, 1)                              // [batch, seqLen] float32
-	cumIdx = ConvertDType(cumIdx, dtypes.Int32)                  // back to int for indexing
-	featureIdx := Sub(cumIdx, Scalar(g, dtypes.Int32, int32(1))) // 0-based
-	numPatches := imageFeatures.Shape().Dimensions[1]
-	featureIdx = MinScalar(MaxScalar(featureIdx, 0), int32(numPatches-1)) // clamp
-
-	// Convert imageFeatures dtype to match hidden if needed.
-	if imageFeatures.DType() != hidden.DType() {
-		imageFeatures = ConvertDType(imageFeatures, hidden.DType())
-	}
-
-	// Gather: for each sequence position, fetch the corresponding image feature.
-	// featureIdx: [batch, seqLen] → gathered: [batch, seqLen, hiddenSize]
-	// We expand featureIdx to [batch, seqLen, 1] and use it to index axis 1 of imageFeatures.
-	featureIdx3D := InsertAxes(featureIdx, -1) // [batch, seqLen, 1]
-	featureIdx3D = BroadcastToDims(featureIdx3D, batchSize, seqLen, hiddenSize) // [batch, seqLen, hiddenSize]
-
-	// Use Gather along axis 1: for each batch element, gather from [numPatches, hiddenSize].
-	// Since GoMLX doesn't have a simple batched gather-by-index, we use OnehostAndDot approach:
-	// Build one-hot [batch, seqLen, numPatches] from featureIdx, then matmul with imageFeatures.
-	featureIdxFlat := Reshape(featureIdx, batchSize*seqLen)
-	oneHot := OneHot(featureIdxFlat, numPatches, dtypes.Float32) // [batch*seqLen, numPatches]
-	oneHot = Reshape(oneHot, batchSize, seqLen, numPatches)               // [batch, seqLen, numPatches]
-	// Matmul: [batch, seqLen, numPatches] @ [batch, numPatches, hiddenSize] = [batch, seqLen, hiddenSize]
-	gathered := Einsum("bsp,bph->bsh", oneHot, imageFeatures)
-
-	// Expand mask and select: image positions get gathered features, others keep hidden.
-	isImage3D := InsertAxes(isImage, -1) // [batch, seqLen, 1]
-	isImage3D = BroadcastToDims(isImage3D, batchSize, seqLen, hiddenSize)
-	return Where(isImage3D, gathered, hidden)
-}
+// gemma3ImageTokenID is the special token ID for <image> placeholders in Gemma 3.
+const gemma3ImageTokenID = int32(262144)
 
 // decoderLayerWithKV runs a single decoder layer using KVCacheAccessor.
 func (b *Builder) decoderLayerWithKV(ctx *context.Context, hidden, positionIDs *Node, kv attention.KVCacheAccessor, aux *decode.AuxInputs, layerIdx, seqLen int) *Node {

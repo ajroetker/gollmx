@@ -1,4 +1,4 @@
-module github.com/ajroetker/gollmx
+module github.com/gomlx/gollmx
 
 go 1.26
 

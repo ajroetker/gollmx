@@ -20,8 +20,8 @@ import (
 	"github.com/gomlx/gomlx/pkg/ml/context"
 	"github.com/gomlx/gomlx/pkg/ml/layers/activations"
 
-	"github.com/ajroetker/gollmx"
-	"github.com/ajroetker/gollmx/architectures/common"
+	"github.com/gomlx/gollmx"
+	"github.com/gomlx/gollmx/architectures/common"
 )
 
 func init() {

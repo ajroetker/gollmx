@@ -28,8 +28,8 @@ import (
 	"github.com/gomlx/gomlx/pkg/ml/layers/attention"
 	"github.com/gomlx/gomlx/pkg/ml/nn"
 
-	models "github.com/ajroetker/gollmx"
-	"github.com/ajroetker/gollmx/architectures/common"
+	models "github.com/gomlx/gollmx"
+	"github.com/gomlx/gollmx/architectures/common"
 )
 
 func init() {

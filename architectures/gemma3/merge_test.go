@@ -11,6 +11,8 @@ import (
 	"github.com/gomlx/gomlx/pkg/core/shapes"
 	"github.com/gomlx/gomlx/pkg/core/tensors"
 	mlctx "github.com/gomlx/gomlx/pkg/ml/context"
+
+	"github.com/gomlx/gollmx/architectures/common"
 )
 
 func TestMergeImageFeatures(t *testing.T) {
@@ -47,12 +49,10 @@ func TestMergeImageFeatures(t *testing.T) {
 	imageTensor := tensors.FromShape(shapes.Make(dtypes.Float32, 1, 3, 4))
 	imageTensor.MutableFlatData(func(data any) { copy(data.([]float32), imageData) })
 
-	builder := &Builder{config: &Config{}}
-
 	ctx := mlctx.New()
 	exec, err := mlctx.NewExec(backend, ctx,
 		func(ctx *mlctx.Context, hidden *Node, imageFeatures *Node, tokensNode *Node) *Node {
-			return builder.mergeImageFeatures(hidden, imageFeatures, tokensNode)
+			return common.MergeImageFeatures(hidden, imageFeatures, tokensNode, gemma3ImageTokenID)
 		})
 	if err != nil {
 		t.Fatalf("NewExec: %v", err)

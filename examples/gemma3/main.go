@@ -31,8 +31,8 @@ import (
 	"github.com/gomlx/gomlx/pkg/core/shapes"
 	"github.com/gomlx/gomlx/pkg/core/tensors"
 	mlctx "github.com/gomlx/gomlx/pkg/ml/context"
-	"github.com/ajroetker/gollmx/kvcache"
-	"github.com/ajroetker/gollmx/serving"
+	"github.com/gomlx/gollmx/kvcache"
+	"github.com/gomlx/gollmx/serving"
 
 	"github.com/gomlx/go-huggingface/hub"
 	"github.com/gomlx/go-huggingface/tokenizers"
@@ -40,8 +40,8 @@ import (
 
 	"golang.org/x/image/draw"
 
-	models "github.com/ajroetker/gollmx"
-	"github.com/ajroetker/gollmx/architectures/gemma3"
+	models "github.com/gomlx/gollmx"
+	"github.com/gomlx/gollmx/architectures/gemma3"
 )
 
 var (

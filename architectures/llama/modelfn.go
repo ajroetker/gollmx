@@ -11,7 +11,7 @@ import (
 	"github.com/gomlx/gomlx/pkg/ml/decode"
 	"github.com/gomlx/gomlx/pkg/ml/layers/attention"
 
-	"github.com/ajroetker/gollmx/architectures/common"
+	"github.com/gomlx/gollmx/architectures/common"
 )
 
 // BuildModelFn returns a decode.ModelFn that uses KVCacheAccessor for

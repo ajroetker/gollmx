@@ -16,7 +16,7 @@ import (
 	"github.com/gomlx/gomlx/pkg/ml/context"
 	"github.com/gomlx/gomlx/pkg/ml/nn"
 
-	models "github.com/ajroetker/gollmx"
+	models "github.com/gomlx/gollmx"
 )
 
 func getGGUFPath() string {
